@@ -6,5 +6,5 @@ google-auth-oauthlib
 google-api-python-client
 google-genai
 python-dotenv
-twilio
+requests
 python-multipart

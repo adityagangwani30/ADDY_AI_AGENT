@@ -6,11 +6,12 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Form, Request
-from fastapi.responses import Response
-from twilio.twiml.messaging_response import MessagingResponse
+import requests
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from brain.ai_brain import run_agent
+from config import TELEGRAM_BOT_TOKEN
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
@@ -20,17 +21,28 @@ def _log(level: int, **payload: object) -> None:
     LOGGER.log(level, json.dumps(payload, default=str))
 
 
-@router.post("/webhook")
-async def whatsapp_webhook(
-    request: Request,
-    Body: str = Form(...),
-):
+@router.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-
-    form_data = await request.form()
-    sender = form_data.get("From", "unknown")
-
     started = time.perf_counter()
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    # Ignore non-message updates (like edits, joins, etc.)
+    if "message" not in data:
+        return JSONResponse({"ok": True})
+
+    message_data = data["message"]
+    chat = message_data.get("chat", {})
+    chat_id = chat.get("id")
+    user_text = message_data.get("text", "")
+
+    if not chat_id or not user_text:
+        return JSONResponse({"ok": True})
+
     _log(
         logging.INFO,
         event="agent_execution_start",
@@ -44,14 +56,17 @@ async def whatsapp_webhook(
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 run_agent,
-                user_message=Body,
-                session_id=sender,
+                user_message=user_text,
+                session_id=str(chat_id),
                 request_id=request_id,
             ),
-            timeout=20,
+            timeout=25,
         )
-        reply = result.message
+
+        reply_text = result.message
+
         latency_ms = int((time.perf_counter() - started) * 1000)
+
         _log(
             logging.INFO,
             event="agent_execution_finish",
@@ -60,8 +75,11 @@ async def whatsapp_webhook(
             latency_ms=latency_ms,
             error_type=result.error_type,
         )
+
     except asyncio.TimeoutError:
+        reply_text = "Request timed out. Please try again."
         latency_ms = int((time.perf_counter() - started) * 1000)
+
         _log(
             logging.ERROR,
             event="agent_execution_timeout",
@@ -70,9 +88,11 @@ async def whatsapp_webhook(
             latency_ms=latency_ms,
             error_type="TimeoutError",
         )
-        reply = "Request timed out after 20 seconds. Please retry."
+
     except Exception as exc:
+        reply_text = "Temporary server error. Please try again."
         latency_ms = int((time.perf_counter() - started) * 1000)
+
         _log(
             logging.ERROR,
             event="agent_execution_error",
@@ -81,13 +101,19 @@ async def whatsapp_webhook(
             latency_ms=latency_ms,
             error_type=type(exc).__name__,
         )
-        reply = "Request failed due to a temporary error. Please retry."
 
-    twilio_response = MessagingResponse()
-    twilio_response.message(reply)
+    # Send reply back to Telegram
+    try:
+        telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(
+            telegram_url,
+            json={
+                "chat_id": chat_id,
+                "text": reply_text,
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass  # Avoid crashing webhook if Telegram send fails
 
-    return Response(
-        content=str(twilio_response),
-        media_type="application/xml",
-        headers={"X-Request-ID": request_id},
-    )
+    return JSONResponse({"ok": True})

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import inspect
 import json
@@ -7,6 +7,8 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime, timezone
+from threading import Lock
 from typing import Any
 
 from google import genai
@@ -26,23 +28,44 @@ _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agent-too
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
 FALLBACK_MODEL_MESSAGE = "I'm having trouble accessing my reasoning model right now. Please try again."
+DAILY_LIMIT_MESSAGE = "Daily AI limit reached. Please try again tomorrow."
+DAILY_GEMINI_CALL_LIMIT = 100
 
-CLASSIFICATION_TIMEOUT_SECONDS = 3
-GEMINI_ANSWER_TIMEOUT_SECONDS = 8
+GEMINI_ANSWER_TIMEOUT_SECONDS = 15
 TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
-
-INTENTS = {
-    "general_knowledge",
-    "gmail_action",
-    "calendar_action",
-    "drive_action",
-    "multi_step",
-}
 
 
 def _log(level: int, **payload: Any) -> None:
     LOGGER.log(level, json.dumps(payload, default=str))
+
+
+class _DailyGeminiLimiter:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._lock = Lock()
+        self._day_utc = datetime.now(timezone.utc).date()
+        self._count = 0
+
+    def try_consume(self) -> bool:
+        today_utc = datetime.now(timezone.utc).date()
+        with self._lock:
+            if today_utc != self._day_utc:
+                self._day_utc = today_utc
+                self._count = 0
+
+            if self._count >= self._limit:
+                return False
+
+            self._count += 1
+            return True
+
+    def snapshot(self) -> tuple[str, int, int]:
+        with self._lock:
+            return self._day_utc.isoformat(), self._count, self._limit
+
+
+_DAILY_GEMINI_LIMITER = _DailyGeminiLimiter(DAILY_GEMINI_CALL_LIMIT)
 
 
 def execute_tool(
@@ -112,15 +135,16 @@ def execute_tool(
 
 class SecureHybridAgent:
     """
-    Hybrid architecture:
-    1) Lightweight intent classification
-    2) Direct Gemini answer for general knowledge
-    3) Tool planning + execution only when needed
+    Simplified architecture:
+    1) Heuristic intent routing (no classification call)
+    2) Max one Gemini call per user message
+    3) Deterministic tool-result formatting (no summary call)
     """
 
     def __init__(self) -> None:
         self.memory_repo = SQLiteMemoryRepository()
         self._genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+        self._daily_limiter = _DAILY_GEMINI_LIMITER
 
     def run(self, user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
         rid = request_id or str(uuid.uuid4())
@@ -162,25 +186,32 @@ class SecureHybridAgent:
             if resolved_alias_account:
                 self.memory_repo.set_account_preference(session_id, resolved_alias_account)
 
-        intent = self._classify_intent(cleaned, history, rid)
+        intent = self._heuristic_intent(lower)
+        preferred_account = self.memory_repo.get_account_preference(session_id)
 
         if intent == "general_knowledge":
+            if not self._reserve_gemini_call(rid, "general_answer"):
+                return self._daily_limit_result(session_id, rid, started, None)
+
             answer = self._answer_general(cleaned, history, rid)
             self.memory_repo.add_conversation(session_id, "assistant", answer)
             self._log_agent_finish(rid, started, None, None)
             return AgentResult(request_id=rid, status="ok", message=answer)
 
-        preferred_account = self.memory_repo.get_account_preference(session_id)
-        decision = self._plan_tool_decision(cleaned, history, preferred_account, intent, rid)
+        decision = self._build_direct_tool_decision(lower, preferred_account)
+        if decision is None:
+            if not self._reserve_gemini_call(rid, "tool_planning"):
+                return self._daily_limit_result(session_id, rid, started, None)
+            decision = self._plan_tool_decision(cleaned, history, preferred_account, intent, rid)
 
         if decision is None:
-            answer = self._answer_general(cleaned, history, rid)
-            self.memory_repo.add_conversation(session_id, "assistant", answer)
-            self._log_agent_finish(rid, started, None, None)
-            return AgentResult(request_id=rid, status="ok", message=answer)
+            message = "I could not determine the required tool action. Please rephrase with the exact action."
+            self.memory_repo.add_conversation(session_id, "assistant", message)
+            self._log_agent_finish(rid, started, None, "ToolDecisionError")
+            return AgentResult(request_id=rid, status="error", message=message, error_type="ToolDecisionError")
 
         if decision.type == "response":
-            text = decision.response or self._answer_general(cleaned, history, rid)
+            text = decision.response or "I could not determine the requested tool action."
             self.memory_repo.add_conversation(session_id, "assistant", text)
             self._log_agent_finish(rid, started, None, None)
             return AgentResult(request_id=rid, status="ok", message=text)
@@ -229,10 +260,43 @@ class SecureHybridAgent:
             tool_name=tool_name,
             account=account,
             parameters=validated,
-            user_message=cleaned,
         )
         self._log_agent_finish(rid, started, tool_name, result.error_type)
         return result
+
+    def _reserve_gemini_call(self, request_id: str, phase: str) -> bool:
+        allowed = self._daily_limiter.try_consume()
+        day_utc, count, limit = self._daily_limiter.snapshot()
+        _log(
+            logging.INFO,
+            event="gemini_quota_check",
+            request_id=request_id,
+            tool_name=phase,
+            day_utc=day_utc,
+            daily_count=count,
+            daily_limit=limit,
+            allowed=allowed,
+            latency_ms=0,
+            error_type=None if allowed else "DailyLimitExceeded",
+        )
+        return allowed
+
+    def _daily_limit_result(
+        self,
+        session_id: str,
+        request_id: str,
+        started: float,
+        tool_name: str | None,
+    ) -> AgentResult:
+        self.memory_repo.add_conversation(session_id, "assistant", DAILY_LIMIT_MESSAGE)
+        self._log_agent_finish(request_id, started, tool_name, "DailyLimitExceeded")
+        return AgentResult(
+            request_id=request_id,
+            status="error",
+            message=DAILY_LIMIT_MESSAGE,
+            tool_name=tool_name,
+            error_type="DailyLimitExceeded",
+        )
 
     def _handle_confirmation(self, session_id: str, request_id: str) -> AgentResult:
         pending = self.memory_repo.get_pending_confirmation(session_id)
@@ -251,7 +315,6 @@ class SecureHybridAgent:
             tool_name=str(pending["tool_name"]),
             account=str(pending["account"]),
             parameters=dict(pending["parameters"]),
-            user_message="confirmed action",
         )
 
     def _execute_and_build_result(
@@ -261,7 +324,6 @@ class SecureHybridAgent:
         tool_name: str,
         account: str,
         parameters: dict[str, Any],
-        user_message: str,
     ) -> AgentResult:
         try:
             tool_response = execute_tool(
@@ -293,13 +355,7 @@ class SecureHybridAgent:
                 error_type=type(exc).__name__,
             )
 
-        summary = self._summarize_tool_result(
-            user_message=user_message,
-            tool_name=tool_name,
-            tool_result=tool_response["result"],
-            request_id=request_id,
-        )
-
+        summary = self._format_tool_result(tool_name, account, tool_response["result"])
         self.memory_repo.add_conversation(session_id, "assistant", summary)
         return AgentResult(
             request_id=request_id,
@@ -310,35 +366,6 @@ class SecureHybridAgent:
             latency_ms=tool_response["latency_ms"],
             data=tool_response["result"],
         )
-
-    def _classify_intent(self, user_message: str, history: list[dict[str, str]], request_id: str) -> str:
-        lower = user_message.lower()
-        if "weather" in lower:
-            return "general_knowledge"
-
-        history_tail = "\n".join(f"{h['role']}: {h['content']}" for h in history[-2:])
-        prompt = (
-            "Classify the user request into exactly one label:\n"
-            "general_knowledge | gmail_action | calendar_action | drive_action | multi_step\n"
-            "Return only the label."
-        )
-        llm_input = f"Recent:\n{history_tail}\n\nUser: {user_message}"
-
-        text = self._call_gemini_with_fallback(
-            system_instruction=prompt,
-            user_message=llm_input,
-            request_id=request_id,
-            phase="intent_classification",
-            timeout_seconds=CLASSIFICATION_TIMEOUT_SECONDS,
-        )
-
-        if not text:
-            return self._heuristic_intent(lower)
-
-        label = text.strip().lower().splitlines()[0].strip()
-        if label in INTENTS:
-            return label
-        return self._heuristic_intent(lower)
 
     def _heuristic_intent(self, lowered_message: str) -> str:
         if any(k in lowered_message for k in ("email", "gmail", "inbox", "mail")):
@@ -364,6 +391,39 @@ class SecureHybridAgent:
         )
         return answer or FALLBACK_MODEL_MESSAGE
 
+    def _build_direct_tool_decision(self, lowered_message: str, preferred_account: str | None) -> AgentDecision | None:
+        if not preferred_account:
+            return None
+
+        if any(phrase in lowered_message for phrase in ("list emails", "show emails", "check inbox", "show inbox", "list inbox")):
+            return AgentDecision(
+                type="tool_call",
+                tool="list_emails",
+                account=preferred_account,
+                parameters={"max_results": 5},
+            )
+
+        if any(
+            phrase in lowered_message
+            for phrase in ("list events", "show events", "upcoming events", "my schedule", "show calendar")
+        ):
+            return AgentDecision(
+                type="tool_call",
+                tool="list_events",
+                account=preferred_account,
+                parameters={"max_results": 10},
+            )
+
+        if any(phrase in lowered_message for phrase in ("list files", "show files", "my files", "drive files")):
+            return AgentDecision(
+                type="tool_call",
+                tool="list_files",
+                account=preferred_account,
+                parameters={"page_size": 10},
+            )
+
+        return None
+
     def _plan_tool_decision(
         self,
         user_message: str,
@@ -380,7 +440,8 @@ class SecureHybridAgent:
             "Return strict JSON only.\n"
             "If tool needed return: {\"type\":\"tool_call\",\"tool\":\"...\",\"account\":\"...\",\"parameters\":{...}}\n"
             "If tool not needed return: {\"type\":\"response\",\"response\":\"...\"}.\n"
-            "Use only these tools: send_email,list_emails,search_email,delete_email,create_event,list_events,delete_event,list_files,upload_file,delete_file"
+            "Use only these tools: send_email,list_emails,search_email,delete_email,create_event,list_events,delete_event,list_files,upload_file,delete_file.\n"
+            "Do not return markdown."
         )
 
         planner_input = (
@@ -406,38 +467,6 @@ class SecureHybridAgent:
             return self._parse_decision(text)
         except ValueError:
             return None
-
-    def _summarize_tool_result(
-        self,
-        user_message: str,
-        tool_name: str,
-        tool_result: Any,
-        request_id: str,
-    ) -> str:
-        result_preview = json.dumps(tool_result, default=str)
-        if len(result_preview) > 1200:
-            result_preview = result_preview[:1200] + "..."
-
-        summary_prompt = (
-            "You are an assistant summarizing a completed action. "
-            "Use plain language. Include key outcome only."
-        )
-
-        text = self._call_gemini_with_fallback(
-            system_instruction=summary_prompt,
-            user_message=(
-                f"User request: {user_message}\n"
-                f"Tool used: {tool_name}\n"
-                f"Tool result JSON: {result_preview}"
-            ),
-            request_id=request_id,
-            phase="tool_summary",
-            timeout_seconds=CLASSIFICATION_TIMEOUT_SECONDS,
-        )
-
-        if text:
-            return text
-        return f"Action completed using '{tool_name}'."
 
     def _call_gemini_with_fallback(
         self,
@@ -622,6 +651,65 @@ class SecureHybridAgent:
             raise ValueError(f"Invalid parameters: {exc}") from exc
 
         return validated.model_dump(exclude_none=True)
+
+    def _format_tool_result(self, tool_name: str, account: str, tool_result: Any) -> str:
+        if tool_name == "list_emails":
+            count = self._safe_int(tool_result, "count")
+            return f"Fetched {count} email(s) for {account}."
+        if tool_name == "search_email":
+            count = self._safe_int(tool_result, "count")
+            return f"Found {count} email(s) matching your query in {account}."
+        if tool_name == "send_email":
+            message_id = self._safe_str(tool_result, "id")
+            return f"Email sent from {account}. Message ID: {message_id}."
+        if tool_name == "delete_email":
+            message_id = self._safe_str(tool_result, "message_id")
+            return f"Deleted email {message_id} from {account}."
+        if tool_name == "list_events":
+            count = self._safe_int(tool_result, "count")
+            return f"Fetched {count} event(s) for {account}."
+        if tool_name == "create_event":
+            event_id = self._safe_str(tool_result, "id")
+            return f"Created event {event_id} for {account}."
+        if tool_name == "delete_event":
+            event_id = self._safe_str(tool_result, "event_id")
+            return f"Deleted event {event_id} for {account}."
+        if tool_name == "list_files":
+            count = self._safe_int(tool_result, "count")
+            return f"Fetched {count} file(s) for {account}."
+        if tool_name == "upload_file":
+            file_name = self._safe_str(tool_result, "name")
+            file_id = self._safe_str(tool_result, "id")
+            return f"Uploaded file '{file_name}' to {account}. File ID: {file_id}."
+        if tool_name == "delete_file":
+            file_id = self._safe_str(tool_result, "file_id")
+            return f"Deleted file {file_id} from {account}."
+
+        preview = json.dumps(tool_result, default=str)
+        if len(preview) > 240:
+            preview = preview[:240] + "..."
+        return f"Action '{tool_name}' completed for {account}. Result: {preview}"
+
+    @staticmethod
+    def _safe_int(payload: Any, key: str) -> int:
+        if isinstance(payload, dict):
+            value = payload.get(key, 0)
+            if isinstance(value, int):
+                return value
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    @staticmethod
+    def _safe_str(payload: Any, key: str) -> str:
+        if isinstance(payload, dict):
+            value = payload.get(key)
+            if value is None:
+                return "unknown"
+            return str(value)
+        return "unknown"
 
     def _is_accounts_question(self, lowered_message: str) -> bool:
         return any(
