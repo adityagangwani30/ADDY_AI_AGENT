@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, Request, Form
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import Response
 from brain.ai_brain import run_agent
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -10,11 +10,13 @@ async def whatsapp_webhook(
     request: Request,
     Body: str = Form(...)
 ):
-    session_id = request.client.host  # simple session mapping
+    # Use phone number as session id
+    form_data = await request.form()
+    sender = form_data.get("From", "unknown")
 
     result = run_agent(
         user_message=Body,
-        session_id=session_id
+        session_id=sender
     )
 
     reply = result.message
@@ -22,4 +24,7 @@ async def whatsapp_webhook(
     twilio_response = MessagingResponse()
     twilio_response.message(reply)
 
-    return PlainTextResponse(str(twilio_response))
+    return Response(
+        content=str(twilio_response),
+        media_type="application/xml"
+    )
