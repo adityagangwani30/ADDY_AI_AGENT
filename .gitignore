@@ -1,0 +1,31 @@
+﻿# WARNING: Local secrets only. Never commit these files.
+.env
+.env.*
+!.env.example
+accounts.json
+client_secret.json
+
+# Runtime state
+*.db
+*.sqlite3
+*.log
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual env
+.venv/
+venv/
+
+# IDE/editor
+.vscode/
+.idea/
