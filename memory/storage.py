@@ -10,16 +10,18 @@ from typing import Any
 
 from config import MEMORY_DB_PATH
 
+# Default account alias memory.
+DEFAULT_ACCOUNT_ALIASES: dict[str, str] = {
+    "exam": "adityagangwaniexam@gmail.com",
+    "college": "1ms23ec007@msrit.edu",
+    "personal": "adityabvbvpn0011@gmail.com",
+    "private": "ashgangcr7@gmail.com",
+}
+
 
 class MemoryRepository(ABC):
     @abstractmethod
-    def save_pending_confirmation(
-        self,
-        session_id: str,
-        tool_name: str,
-        account: str,
-        parameters: dict[str, Any],
-    ) -> None:
+    def save_pending_confirmation(self, session_id: str, tool_name: str, account: str, parameters: dict[str, Any]) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -62,8 +64,8 @@ class SQLiteMemoryRepository(MemoryRepository):
     def _initialize_schema(self) -> None:
         with self._lock:
             with self._connect() as conn:
-                conn.execute(
-                    """
+
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS pending_confirmations (
                         session_id TEXT PRIMARY KEY,
                         tool_name TEXT NOT NULL,
@@ -71,10 +73,9 @@ class SQLiteMemoryRepository(MemoryRepository):
                         parameters_json TEXT NOT NULL,
                         created_at TEXT NOT NULL
                     )
-                    """
-                )
-                conn.execute(
-                    """
+                """)
+
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS conversation_history (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_id TEXT NOT NULL,
@@ -82,32 +83,35 @@ class SQLiteMemoryRepository(MemoryRepository):
                         content TEXT NOT NULL,
                         created_at TEXT NOT NULL
                     )
-                    """
-                )
-                conn.execute(
-                    """
+                """)
+
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS account_preferences (
                         session_id TEXT PRIMARY KEY,
                         account TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
-                    """
-                )
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS account_aliases (
+                        alias TEXT PRIMARY KEY,
+                        account TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+
                 conn.commit()
 
-    def save_pending_confirmation(
-        self,
-        session_id: str,
-        tool_name: str,
-        account: str,
-        parameters: dict[str, Any],
-    ) -> None:
+    # ---------------- Pending Confirmation ----------------
+
+    def save_pending_confirmation(self, session_id: str, tool_name: str, account: str, parameters: dict[str, Any]) -> None:
         payload = json.dumps(parameters)
         timestamp = datetime.now(timezone.utc).isoformat()
+
         with self._lock:
             with self._connect() as conn:
-                conn.execute(
-                    """
+                conn.execute("""
                     INSERT INTO pending_confirmations (session_id, tool_name, account, parameters_json, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
@@ -115,32 +119,23 @@ class SQLiteMemoryRepository(MemoryRepository):
                         account=excluded.account,
                         parameters_json=excluded.parameters_json,
                         created_at=excluded.created_at
-                    """,
-                    (session_id, tool_name, account, payload, timestamp),
-                )
+                """, (session_id, tool_name, account, payload, timestamp))
                 conn.commit()
 
     def get_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
             with self._connect() as conn:
-                row = conn.execute(
-                    """
-                    SELECT session_id, tool_name, account, parameters_json, created_at
-                    FROM pending_confirmations
-                    WHERE session_id = ?
-                    """,
-                    (session_id,),
-                ).fetchone()
+                row = conn.execute("""
+                    SELECT * FROM pending_confirmations WHERE session_id = ?
+                """, (session_id,)).fetchone()
 
-        if row is None:
+        if not row:
             return None
 
         return {
-            "session_id": row["session_id"],
             "tool_name": row["tool_name"],
             "account": row["account"],
             "parameters": json.loads(row["parameters_json"]),
-            "created_at": row["created_at"],
         }
 
     def clear_pending_confirmation(self, session_id: str) -> None:
@@ -149,93 +144,90 @@ class SQLiteMemoryRepository(MemoryRepository):
                 conn.execute("DELETE FROM pending_confirmations WHERE session_id = ?", (session_id,))
                 conn.commit()
 
+    # ---------------- Conversation ----------------
+
     def add_conversation(self, session_id: str, role: str, content: str) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
-                conn.execute(
-                    """
+                conn.execute("""
                     INSERT INTO conversation_history (session_id, role, content, created_at)
                     VALUES (?, ?, ?, ?)
-                    """,
-                    (session_id, role, content, timestamp),
-                )
+                """, (session_id, role, content, timestamp))
                 conn.commit()
 
     def get_conversation(self, session_id: str, limit: int = 12) -> list[dict[str, str]]:
-        bounded_limit = max(1, min(limit, 100))
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT role, content
-                    FROM conversation_history
+                rows = conn.execute("""
+                    SELECT role, content FROM conversation_history
                     WHERE session_id = ?
                     ORDER BY id DESC
                     LIMIT ?
-                    """,
-                    (session_id, bounded_limit),
-                ).fetchall()
+                """, (session_id, limit)).fetchall()
 
-        items = [{"role": row["role"], "content": row["content"]} for row in rows]
-        items.reverse()
-        return items
+        result = [{"role": r["role"], "content": r["content"]} for r in rows]
+        result.reverse()
+        return result
+
+    # ---------------- Account Preference ----------------
 
     def set_account_preference(self, session_id: str, account: str) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
-                conn.execute(
-                    """
+                conn.execute("""
                     INSERT INTO account_preferences (session_id, account, updated_at)
                     VALUES (?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         account=excluded.account,
                         updated_at=excluded.updated_at
-                    """,
-                    (session_id, account, timestamp),
-                )
+                """, (session_id, account, timestamp))
                 conn.commit()
 
     def get_account_preference(self, session_id: str) -> str | None:
         with self._lock:
             with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT account FROM account_preferences WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
+                row = conn.execute("""
+                    SELECT account FROM account_preferences WHERE session_id = ?
+                """, (session_id,)).fetchone()
 
-        if row is None:
-            return None
-        return str(row["account"])
+        return row["account"] if row else None
 
+    # ---------------- Alias System ----------------
 
-class PostgresMemoryRepository(MemoryRepository):
-    """Postgres-ready placeholder for production migration."""
+    def set_account_alias(self, alias: str, account: str) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("""
+                    INSERT INTO account_aliases (alias, account, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(alias) DO UPDATE SET
+                        account=excluded.account
+                """, (alias.lower(), account, timestamp))
+                conn.commit()
 
-    def save_pending_confirmation(
-        self,
-        session_id: str,
-        tool_name: str,
-        account: str,
-        parameters: dict[str, Any],
-    ) -> None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
+    def get_account_by_alias(self, alias: str) -> str | None:
+        alias_key = alias.lower()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("""
+                    SELECT account FROM account_aliases WHERE alias = ?
+                """, (alias_key,)).fetchone()
 
-    def get_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
+        if row:
+            return row["account"]
+        return DEFAULT_ACCOUNT_ALIASES.get(alias_key)
 
-    def clear_pending_confirmation(self, session_id: str) -> None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
+    def list_account_aliases(self) -> dict[str, str]:
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute("""
+                    SELECT alias, account FROM account_aliases
+                """).fetchall()
 
-    def add_conversation(self, session_id: str, role: str, content: str) -> None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
-
-    def get_conversation(self, session_id: str, limit: int = 12) -> list[dict[str, str]]:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
-
-    def set_account_preference(self, session_id: str, account: str) -> None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
-
-    def get_account_preference(self, session_id: str) -> str | None:
-        raise NotImplementedError("PostgresMemoryRepository is not implemented yet.")
+        aliases = dict(DEFAULT_ACCOUNT_ALIASES)
+        for row in rows:
+            aliases[row["alias"]] = row["account"]
+        return aliases
