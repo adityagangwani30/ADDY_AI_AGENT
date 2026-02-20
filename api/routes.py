@@ -1,45 +1,25 @@
-﻿from __future__ import annotations
-
-import logging
-
-from fastapi import APIRouter, Header, HTTPException, Request
-
-from api.security import verify_webhook_signature
-from domain.schemas import AgentResult, WebhookRequest
-from services.agent_service import process_incoming_message
-from services.logging_service import log_event
+﻿from fastapi import APIRouter, Request, Form
+from fastapi.responses import PlainTextResponse
+from brain.ai_brain import run_agent
+from twilio.twiml.messaging_response import MessagingResponse
 
 router = APIRouter()
-LOGGER = logging.getLogger(__name__)
 
-
-@router.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
-
-
-@router.post("/webhook", response_model=AgentResult)
-async def webhook(
-    payload: WebhookRequest,
+@router.post("/webhook")
+async def whatsapp_webhook(
     request: Request,
-    x_signature: str | None = Header(default=None, alias="X-Signature-256"),
-) -> AgentResult:
-    request_id = str(getattr(request.state, "request_id", "unknown"))
-    raw_body = getattr(request.state, "raw_body", b"")
+    Body: str = Form(...)
+):
+    session_id = request.client.host  # simple session mapping
 
-    if not verify_webhook_signature(raw_body, x_signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-    result = await process_incoming_message(payload, request_id=request_id)
-
-    log_event(
-        LOGGER,
-        logging.INFO,
-        event="webhook_processed",
-        request_id=request_id,
-        tool_name=result.tool_name,
-        account=result.account,
-        latency_ms=result.latency_ms,
-        error_type=result.error_type,
+    result = run_agent(
+        user_message=Body,
+        session_id=session_id
     )
-    return result
+
+    reply = result.message
+
+    twilio_response = MessagingResponse()
+    twilio_response.message(reply)
+
+    return PlainTextResponse(str(twilio_response))
