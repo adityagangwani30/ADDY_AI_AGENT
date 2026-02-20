@@ -29,3 +29,6 @@ venv/
 # IDE/editor
 .vscode/
 .idea/
+
+memory/assistant_memory.db
+__pycache__/
