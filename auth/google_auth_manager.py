@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-
+import os
 from google.oauth2.credentials import Credentials
 
 from config import ACCOUNTS_FILE, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_SCOPES, GOOGLE_TOKEN_URI
@@ -14,12 +14,11 @@ class AuthConfigurationError(RuntimeError):
 
 # WARNING: accounts.json contains refresh tokens and must never be committed.
 def _load_accounts() -> dict:
-    accounts_path = Path(ACCOUNTS_FILE)
-    if not accounts_path.exists():
-        raise FileNotFoundError(f"Accounts file not found: {accounts_path}")
+    accounts_json = os.getenv("ACCOUNTS_JSON")
+    if not accounts_json:
+        raise FileNotFoundError("ACCOUNTS_JSON environment variable not set.")
 
-    with accounts_path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    return json.loads(accounts_json)
 
 
 def list_available_accounts() -> set[str]:
