@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,8 +45,6 @@ GOOGLE_SCOPES = _env_list(
     ],
 )
 
-ACCOUNTS_FILE = Path(_env("ACCOUNTS_FILE", str(BASE_DIR / "accounts.json")))
-CLIENT_SECRET_FILE = Path(_env("CLIENT_SECRET_FILE", str(BASE_DIR / "client_secret.json")))
 MEMORY_DB_PATH = Path(_env("MEMORY_DB_PATH", str(BASE_DIR / "memory" / "assistant_memory.db")))
 
 WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
@@ -54,8 +53,6 @@ WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
 # --------------- Startup validation ---------------
 # Warn loudly about missing critical env vars so Render deployments fail fast.
 
-import sys as _sys
-
 _CRITICAL_VARS = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
     "GEMINI_API_KEY": GEMINI_API_KEY,
@@ -63,10 +60,10 @@ _CRITICAL_VARS = {
 
 for _name, _value in _CRITICAL_VARS.items():
     if not _value:
-        print(f"WARNING: {_name} is not set. The application will not function correctly.", file=_sys.stderr)
+        print(f"WARNING: {_name} is not set. The application will not function correctly.", file=sys.stderr)
 
 if not _env("ACCOUNTS_JSON"):
     print(
         "WARNING: ACCOUNTS_JSON is not set. Google account credentials will be unavailable.",
-        file=_sys.stderr,
+        file=sys.stderr,
     )

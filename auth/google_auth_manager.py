@@ -13,7 +13,6 @@ LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ACCOUNTS_FILE = BASE_DIR / "accounts.json"
-CLIENT_SECRET_FILE = BASE_DIR / "client_secret.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -35,7 +34,7 @@ class AuthConfigurationError(RuntimeError):
 def load_accounts() -> dict[str, Any]:
     """Load accounts with ENV priority (Render-safe)."""
 
-    # 🔥 Priority 1: ENV (Render)
+    # Priority 1: ENV (Render / cloud)
     env_value = os.getenv("ACCOUNTS_JSON")
     if env_value:
         try:
@@ -45,7 +44,7 @@ def load_accounts() -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             LOGGER.error("Failed to parse ACCOUNTS_JSON env var: %s", exc)
 
-    # 🔥 Priority 2: local file
+    # Priority 2: local file (dev fallback)
     if ACCOUNTS_FILE.exists():
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as fh:
@@ -55,14 +54,14 @@ def load_accounts() -> dict[str, Any]:
         except (json.JSONDecodeError, IOError) as exc:
             LOGGER.error("Failed to load %s: %s", ACCOUNTS_FILE, exc)
 
+    LOGGER.warning("No account data found (neither ACCOUNTS_JSON env nor %s file).", ACCOUNTS_FILE)
     return {}
 
 
 def save_accounts(accounts: dict[str, Any]) -> None:
     """Persist credentials locally (skip in cloud)."""
-
     if os.getenv("ACCOUNTS_JSON"):
-        LOGGER.info("Skipping save in cloud environment")
+        LOGGER.info("Skipping save — cloud environment (ACCOUNTS_JSON is set).")
         return
 
     try:
@@ -74,6 +73,7 @@ def save_accounts(accounts: dict[str, Any]) -> None:
 
 
 def list_available_accounts() -> list[str]:
+    """Return account emails that have stored credentials."""
     return list(load_accounts().keys())
 
 
@@ -87,29 +87,40 @@ def get_credentials(account_name: str) -> Credentials:
     Return valid Google OAuth credentials for *account_name*.
 
     Flow:
-      1. Load stored credentials from accounts.json
-      2. If expired → auto-refresh via refresh_token
-      3. If refresh fails or no stored creds → run InstalledAppFlow (local only)
-      4. Save full credential object back to accounts.json
+      1. Load stored credentials (from ENV or file)
+      2. Build Credentials object (supports old and new format)
+      3. If expired → auto-refresh via refresh_token
+      4. If refresh fails → raise clear error (no silent failure)
     """
     accounts = load_accounts()
-    creds: Credentials | None = None
     account_data = accounts.get(account_name)
 
-    # ── Step 1: build Credentials from stored data ──
-    if account_data:
-        creds = _build_credentials_from_stored(account_name, account_data)
+    if not account_data:
+        raise AuthConfigurationError(
+            f"Account '{account_name}' not found. "
+            f"Available: {list(accounts.keys())}"
+        )
 
-    # ── Step 2: refresh if needed ──
-    if creds and not creds.valid:
+    # Build Credentials from stored data
+    creds = _build_credentials_from_stored(account_name, account_data)
+
+    if creds is None:
+        raise AuthConfigurationError(
+            f"Could not build credentials for '{account_name}'. "
+            "Check that the account data contains a valid refresh_token, client_id, and client_secret."
+        )
+
+    # Auto-refresh if expired
+    if not creds.valid:
         creds = _try_refresh(account_name, creds)
 
-    # ── Step 3: re-authenticate if still invalid ──
-    if not creds or not creds.valid:
-        LOGGER.info("No valid credentials for '%s'. Starting OAuth flow...", account_name)
-        creds = _run_oauth_flow(account_name)
+    if creds is None:
+        raise AuthConfigurationError(
+            f"Token refresh failed for '{account_name}'. "
+            "The refresh_token may be revoked. Re-authenticate locally and update ACCOUNTS_JSON."
+        )
 
-    # ── Step 4: persist full credentials ──
+    # Persist updated token (locally only)
     _save_credential(accounts, account_name, creds)
 
     return creds
@@ -124,21 +135,17 @@ def _build_credentials_from_stored(
     account_name: str,
     account_data: dict[str, Any],
 ) -> Credentials | None:
-    """Try to construct Credentials from stored JSON data (new or old format)."""
+    """Build Credentials from stored JSON data (supports old and new format)."""
 
     # New format: full credential object (has client_id or token)
     if "client_id" in account_data or "token" in account_data:
         try:
             return Credentials.from_authorized_user_info(account_data, SCOPES)
         except Exception as exc:
-            LOGGER.warning(
-                "Failed to load full credentials for '%s': %s",
-                account_name,
-                exc,
-            )
+            LOGGER.warning("Failed to load full credentials for '%s': %s", account_name, exc)
             return None
 
-    # Old format: only refresh_token — build manually using config values
+    # Old format: only refresh_token — build using config values
     refresh_token = account_data.get("refresh_token")
     if refresh_token:
         from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_TOKEN_URI
@@ -146,7 +153,7 @@ def _build_credentials_from_stored(
         if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
             LOGGER.warning(
                 "Cannot build credentials for '%s': "
-                "old format (refresh_token only) requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.",
+                "old format requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.",
                 account_name,
             )
             return None
@@ -175,42 +182,8 @@ def _try_refresh(account_name: str, creds: Credentials) -> Credentials | None:
         LOGGER.info("Successfully refreshed token for '%s'.", account_name)
         return creds
     except Exception as exc:
-        LOGGER.warning(
-            "Token refresh failed for '%s': %s. Will re-authenticate.",
-            account_name,
-            exc,
-        )
+        LOGGER.error("Token refresh failed for '%s': %s", account_name, exc)
         return None
-
-
-def _run_oauth_flow(account_name: str) -> Credentials:
-    """Run InstalledAppFlow to obtain fresh credentials (requires a browser)."""
-    if not CLIENT_SECRET_FILE.exists():
-        raise AuthConfigurationError(
-            f"Cannot authenticate '{account_name}': "
-            f"client_secret.json not found at {CLIENT_SECRET_FILE}. "
-            "Re-authentication requires a local environment with a browser."
-        )
-
-    # Lazy import — only needed when re-authenticating
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    try:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            str(CLIENT_SECRET_FILE),
-            SCOPES,
-        )
-        # Use port 8080 to match the redirect_uri configured in client_secret.json
-        flow.redirect_uri = "http://localhost:8080/"
-        print(f"\n🔐 Authenticating: {account_name}")
-        print("   A browser window will open. Sign in with this account.\n")
-        creds = flow.run_local_server(port=8080, open_browser=True)
-    except Exception as exc:
-        raise AuthConfigurationError(
-            f"OAuth flow failed for '{account_name}': {exc}"
-        ) from exc
-
-    return creds
 
 
 def _save_credential(
@@ -218,7 +191,7 @@ def _save_credential(
     account_name: str,
     creds: Credentials,
 ) -> None:
-    """Store the full credential object for an account and persist to disk."""
+    """Store the full credential object and persist (local only)."""
     accounts[account_name] = {
         "token": creds.token,
         "refresh_token": creds.refresh_token,
