@@ -1,3 +1,11 @@
+"""
+Core AI agent for the personal assistant.
+
+Contains ``SecureHybridAgent``, which routes user messages either to direct
+tool execution (fast heuristic path) or to Google Gemini for natural-language
+tool planning. Also exposes ``execute_tool`` and the module-level ``run_agent``
+entry point used by the FastAPI route handler.
+"""
 from __future__ import annotations
 
 import inspect
@@ -74,6 +82,23 @@ def execute_tool(
     parameters: dict[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
+    """
+    Dispatch a registered tool function in a thread pool with timeout enforcement.
+
+    Args:
+        tool_name: Name of the tool to execute (must be in the tool registry).
+        account: The account identifier to pass as the first argument to the tool.
+        parameters: Keyword arguments forwarded to the tool function.
+        request_id: Unique request identifier for structured logging.
+
+    Returns:
+        A dict with ``latency_ms`` (int) and ``result`` (tool's return value).
+
+    Raises:
+        ValueError: If the tool is not registered.
+        TimeoutError: If the tool exceeds ``TOOL_TIMEOUT_SECONDS``.
+        RuntimeError: If the tool raises any other exception.
+    """
     if tool_name not in TOOLS:
         raise ValueError(f"Tool '{tool_name}' is not registered.")
 
@@ -147,6 +172,23 @@ class SecureHybridAgent:
         self._daily_limiter = _DAILY_GEMINI_LIMITER
 
     def run(self, user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
+        """
+        Process a user message and return an ``AgentResult``.
+
+        Routing order:
+        1. Account overview shortcut (no tool / no Gemini call).
+        2. Confirmation / cancellation of pending destructive actions.
+        3. Heuristic intent detection → direct tool execution (no Gemini call).
+        4. Gemini tool planner → validated tool execution.
+
+        Args:
+            user_message: Raw text message from the user.
+            session_id: Telegram ``chat_id`` used to scope memory.
+            request_id: Optional trace ID; auto-generated if omitted.
+
+        Returns:
+            An ``AgentResult`` with ``status``, ``message``, and optional metadata.
+        """
         rid = request_id or str(uuid.uuid4())
         started = time.perf_counter()
         cleaned = user_message.strip()
@@ -265,6 +307,12 @@ class SecureHybridAgent:
         return result
 
     def _reserve_gemini_call(self, request_id: str, phase: str) -> bool:
+        """
+        Attempt to consume one Gemini quota unit for the current UTC day.
+
+        Returns:
+            ``True`` if the call is allowed, ``False`` if the daily limit is reached.
+        """
         allowed = self._daily_limiter.try_consume()
         day_utc, count, limit = self._daily_limiter.snapshot()
         _log(
@@ -372,6 +420,13 @@ class SecureHybridAgent:
     _DRIVE_KEYWORDS = ("drive", "file", "files", "folder", "upload", "document", "documents", "storage")
 
     def _heuristic_intent(self, lowered_message: str) -> str:
+        """
+        Classify the user's intent using keyword matching (no LLM call).
+
+        Returns:
+            One of ``"gmail_action"``, ``"calendar_action"``, ``"drive_action"``,
+            or ``"general_knowledge"``.
+        """
         if any(k in lowered_message for k in self._GMAIL_KEYWORDS):
             return "gmail_action"
         if any(k in lowered_message for k in self._CALENDAR_KEYWORDS):
@@ -397,7 +452,19 @@ class SecureHybridAgent:
 
     _SEARCH_EMAIL_PHRASES = ("search email", "find email", "emails from", "emails about", "mail from", "mail about")
 
-    def _build_direct_tool_decision(self, lowered_message: str, preferred_account: str | None) -> AgentDecision | None:
+    def _build_direct_tool_decision(
+        self, lowered_message: str, preferred_account: str | None
+    ) -> AgentDecision | None:
+        """
+        Attempt to build a tool decision purely from keyword heuristics.
+
+        Skips the Gemini planner entirely when a known pattern is found.
+        Requires a ``preferred_account`` to be set (from previous session context).
+
+        Returns:
+            An ``AgentDecision`` with ``type="tool_call"``, or ``None`` if no
+            heuristic matched.
+        """
         if not preferred_account:
             return None
 
@@ -496,6 +563,23 @@ class SecureHybridAgent:
         phase: str,
         timeout_seconds: int,
     ) -> str | None:
+        """
+        Call the Gemini API with automatic model fallback.
+
+        Tries each model in ``GEMINI_MODELS`` in order.  Handles
+        ``request_options`` ``TypeError`` for older SDK versions, ``TimeoutError``,
+        and general API errors.  Returns ``None`` only when all models fail.
+
+        Args:
+            system_instruction: System prompt to guide model behaviour.
+            user_message: The user's query or planner input.
+            request_id: Trace ID for structured logging.
+            phase: Label for the current call phase (e.g. ``"tool_planning"``).
+            timeout_seconds: Wall-clock timeout enforced via thread future.
+
+        Returns:
+            Raw text from the model, or ``None`` on total failure.
+        """
         if self._genai_client is None:
             _log(
                 logging.ERROR,
@@ -618,6 +702,15 @@ class SecureHybridAgent:
 
     @staticmethod
     def _extract_text(response: Any) -> str:
+        """
+        Safely extract text content from a Gemini API response object.
+
+        Handles both the top-level ``.text`` shortcut and the nested
+        ``candidates → content → parts`` structure.
+
+        Returns:
+            The extracted text string, or an empty string if nothing is found.
+        """
         text = getattr(response, "text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
@@ -639,6 +732,15 @@ class SecureHybridAgent:
         return ""
 
     def _parse_decision(self, llm_text: str) -> AgentDecision:
+        """
+        Parse a JSON tool-decision string returned by the Gemini planner.
+
+        Strips optional markdown fences and extracts the first JSON object
+        found in the response.
+
+        Raises:
+            ValueError: If no valid JSON object can be extracted.
+        """
         raw = llm_text.strip()
 
         fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
@@ -653,7 +755,21 @@ class SecureHybridAgent:
         payload = json.loads(raw[start : end + 1])
         return AgentDecision.model_validate(payload)
 
-    def _validate_tool_call(self, tool_name: str, account: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    def _validate_tool_call(
+        self, tool_name: str, account: str, parameters: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Validate that a tool call is safe to execute.
+
+        Checks that the tool is allowlisted, the account is available, and
+        the parameters pass Pydantic schema validation.
+
+        Returns:
+            A clean parameter dict (``None`` values excluded).
+
+        Raises:
+            ValueError: On any validation failure.
+        """
         if tool_name not in TOOLS:
             raise ValueError(f"Tool '{tool_name}' is not allowlisted.")
 
@@ -768,6 +884,17 @@ class SecureHybridAgent:
         return None
 
     def _resolve_account_identifier(self, raw_identifier: str) -> str | None:
+        """
+        Resolve a raw account string to a verified account key.
+
+        Resolution order:
+        1. Exact match against available accounts.
+        2. Case-insensitive match.
+        3. Alias lookup (DB + defaults), then re-matched against available accounts.
+
+        Returns:
+            The resolved account key, or ``None`` if unresolvable.
+        """
         identifier = raw_identifier.strip().lower()
         if not identifier:
             return None
@@ -807,4 +934,17 @@ _AGENT = SecureHybridAgent()
 
 
 def run_agent(user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
+    """
+    Module-level entry point for running the singleton agent.
+
+    Called by the FastAPI route handler via ``asyncio.to_thread``.
+
+    Args:
+        user_message: The user's Telegram message text.
+        session_id: Telegram ``chat_id`` cast to string.
+        request_id: Optional trace ID propagated from the HTTP request.
+
+    Returns:
+        An ``AgentResult`` containing the reply and metadata.
+    """
     return _AGENT.run(user_message, session_id, request_id)

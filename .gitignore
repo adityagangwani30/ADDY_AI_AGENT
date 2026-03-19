@@ -1,16 +1,14 @@
-﻿# WARNING: Local secrets only. Never commit these files.
+# ─── Secrets & Credentials ────────────────────────────────────────────────────
+# NEVER commit these files — they contain OAuth tokens and API keys.
 .env
 .env.*
 !.env.example
 accounts.json
 client_secret.json
+*.key
+*.pem
 
-# Runtime state
-*.db
-*.sqlite3
-*.log
-
-# Python artifacts
+# ─── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -22,13 +20,23 @@ __pycache__/
 coverage.xml
 htmlcov/
 
-# Virtual env
+# ─── Virtual Environment ───────────────────────────────────────────────────────
 .venv/
 venv/
 
-# IDE/editor
+# ─── Runtime State ─────────────────────────────────────────────────────────────
+*.db
+*.sqlite3
+*.log
+
+# ─── OS Files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── IDE / Editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 
-memory/assistant_memory.db
-__pycache__/
+# ─── Build Artifacts ───────────────────────────────────────────────────────────
+dist/
+build/

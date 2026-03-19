@@ -1,4 +1,11 @@
-﻿from __future__ import annotations
+"""
+Persistent memory storage for the AI assistant.
+
+Provides a SQLite-backed implementation of the ``MemoryRepository`` abstract
+base class, covering: pending action confirmations, per-session conversation
+history, account preferences, and account alias management.
+"""
+from __future__ import annotations
 
 import json
 import sqlite3
@@ -50,6 +57,17 @@ class MemoryRepository(ABC):
 
 
 class SQLiteMemoryRepository(MemoryRepository):
+    """
+    SQLite-backed implementation of ``MemoryRepository``.
+
+    Thread-safe via an internal ``threading.Lock``.  All writes are committed
+    immediately so that concurrent readers always see the latest state.
+
+    Args:
+        db_path: Optional path to the SQLite database file.  Falls back to
+            ``MEMORY_DB_PATH`` from ``config`` if not provided.
+    """
+
     def __init__(self, db_path: Path | str | None = None) -> None:
         self.db_path = Path(db_path or MEMORY_DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,11 +75,13 @@ class SQLiteMemoryRepository(MemoryRepository):
         self._initialize_schema()
 
     def _connect(self) -> sqlite3.Connection:
+        """Open a new SQLite connection with row factory enabled."""
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
         return connection
 
     def _initialize_schema(self) -> None:
+        """Create all required tables if they do not already exist."""
         with self._lock:
             with self._connect() as conn:
 
@@ -105,7 +125,14 @@ class SQLiteMemoryRepository(MemoryRepository):
 
     # ---------------- Pending Confirmation ----------------
 
-    def save_pending_confirmation(self, session_id: str, tool_name: str, account: str, parameters: dict[str, Any]) -> None:
+    def save_pending_confirmation(
+        self, session_id: str, tool_name: str, account: str, parameters: dict[str, Any]
+    ) -> None:
+        """
+        Persist a destructive action awaiting user confirmation.
+
+        Overwrites any existing pending confirmation for the same session.
+        """
         payload = json.dumps(parameters)
         timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -123,6 +150,13 @@ class SQLiteMemoryRepository(MemoryRepository):
                 conn.commit()
 
     def get_pending_confirmation(self, session_id: str) -> dict[str, Any] | None:
+        """
+        Retrieve an unconfirmed pending action for the given session.
+
+        Returns:
+            A dict with ``tool_name``, ``account``, and ``parameters``;
+            or ``None`` if no pending confirmation exists.
+        """
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute("""
@@ -139,6 +173,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         }
 
     def clear_pending_confirmation(self, session_id: str) -> None:
+        """Delete the pending confirmation for the given session (after confirmation or cancellation)."""
         with self._lock:
             with self._connect() as conn:
                 conn.execute("DELETE FROM pending_confirmations WHERE session_id = ?", (session_id,))
@@ -147,6 +182,7 @@ class SQLiteMemoryRepository(MemoryRepository):
     # ---------------- Conversation ----------------
 
     def add_conversation(self, session_id: str, role: str, content: str) -> None:
+        """Append a new message to the conversation history for the given session."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
@@ -157,6 +193,16 @@ class SQLiteMemoryRepository(MemoryRepository):
                 conn.commit()
 
     def get_conversation(self, session_id: str, limit: int = 12) -> list[dict[str, str]]:
+        """
+        Retrieve the most recent conversation messages for a session.
+
+        Args:
+            session_id: The session to query.
+            limit: Maximum number of messages to return (most recent first, then reversed).
+
+        Returns:
+            A list of dicts with ``role`` and ``content`` in chronological order.
+        """
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute("""
@@ -173,6 +219,7 @@ class SQLiteMemoryRepository(MemoryRepository):
     # ---------------- Account Preference ----------------
 
     def set_account_preference(self, session_id: str, account: str) -> None:
+        """Persist the most recently used account for a session."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
@@ -186,6 +233,9 @@ class SQLiteMemoryRepository(MemoryRepository):
                 conn.commit()
 
     def get_account_preference(self, session_id: str) -> str | None:
+        """
+        Return the last-used account for a session, or ``None`` if not set.
+        """
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute("""
@@ -197,6 +247,7 @@ class SQLiteMemoryRepository(MemoryRepository):
     # ---------------- Alias System ----------------
 
     def set_account_alias(self, alias: str, account: str) -> None:
+        """Map a short alias (e.g. ``"college"``) to a full account email address."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._connect() as conn:
@@ -209,6 +260,12 @@ class SQLiteMemoryRepository(MemoryRepository):
                 conn.commit()
 
     def get_account_by_alias(self, alias: str) -> str | None:
+        """
+        Look up an account email by alias, falling back to the built-in defaults.
+
+        Returns:
+            The account email string, or ``None`` if not found.
+        """
         alias_key = alias.lower()
         with self._lock:
             with self._connect() as conn:
@@ -221,6 +278,12 @@ class SQLiteMemoryRepository(MemoryRepository):
         return DEFAULT_ACCOUNT_ALIASES.get(alias_key)
 
     def list_account_aliases(self) -> dict[str, str]:
+        """
+        Return all known alias → account mappings, merging DB rows over defaults.
+
+        Returns:
+            A dict mapping alias strings to email addresses.
+        """
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute("""
