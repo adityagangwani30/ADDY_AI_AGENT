@@ -367,12 +367,16 @@ class SecureHybridAgent:
             data=tool_response["result"],
         )
 
+    _GMAIL_KEYWORDS = ("email", "emails", "mail", "mails", "gmail", "inbox", "unread", "message", "messages")
+    _CALENDAR_KEYWORDS = ("calendar", "event", "events", "schedule", "meeting", "agenda", "appointments")
+    _DRIVE_KEYWORDS = ("drive", "file", "files", "folder", "upload", "document", "documents", "storage")
+
     def _heuristic_intent(self, lowered_message: str) -> str:
-        if any(k in lowered_message for k in ("email", "gmail", "inbox", "mail")):
+        if any(k in lowered_message for k in self._GMAIL_KEYWORDS):
             return "gmail_action"
-        if any(k in lowered_message for k in ("calendar", "event", "schedule", "meeting")):
+        if any(k in lowered_message for k in self._CALENDAR_KEYWORDS):
             return "calendar_action"
-        if any(k in lowered_message for k in ("drive", "file", "folder", "upload")):
+        if any(k in lowered_message for k in self._DRIVE_KEYWORDS):
             return "drive_action"
         return "general_knowledge"
 
@@ -391,11 +395,28 @@ class SecureHybridAgent:
         )
         return answer or FALLBACK_MODEL_MESSAGE
 
+    _SEARCH_EMAIL_PHRASES = ("search email", "find email", "emails from", "emails about", "mail from", "mail about")
+
     def _build_direct_tool_decision(self, lowered_message: str, preferred_account: str | None) -> AgentDecision | None:
         if not preferred_account:
             return None
 
-        if any(phrase in lowered_message for phrase in ("list emails", "show emails", "check inbox", "show inbox", "list inbox")):
+        # Search-email detection (must come before generic email detection)
+        if any(phrase in lowered_message for phrase in self._SEARCH_EMAIL_PHRASES):
+            # Extract a rough query from the message by stripping common prefixes
+            query = lowered_message
+            for prefix in ("search email", "find email", "search emails", "find emails"):
+                query = query.replace(prefix, "")
+            query = query.strip() or "is:unread"
+            return AgentDecision(
+                type="tool_call",
+                tool="search_email",
+                account=preferred_account,
+                parameters={"query": query, "max_results": 10},
+            )
+
+        # Flexible email keyword matching
+        if any(k in lowered_message for k in self._GMAIL_KEYWORDS):
             return AgentDecision(
                 type="tool_call",
                 tool="list_emails",
@@ -403,10 +424,8 @@ class SecureHybridAgent:
                 parameters={"max_results": 5},
             )
 
-        if any(
-            phrase in lowered_message
-            for phrase in ("list events", "show events", "upcoming events", "my schedule", "show calendar")
-        ):
+        # Flexible calendar keyword matching
+        if any(k in lowered_message for k in self._CALENDAR_KEYWORDS):
             return AgentDecision(
                 type="tool_call",
                 tool="list_events",
@@ -414,7 +433,8 @@ class SecureHybridAgent:
                 parameters={"max_results": 10},
             )
 
-        if any(phrase in lowered_message for phrase in ("list files", "show files", "my files", "drive files")):
+        # Flexible drive keyword matching
+        if any(k in lowered_message for k in self._DRIVE_KEYWORDS):
             return AgentDecision(
                 type="tool_call",
                 tool="list_files",

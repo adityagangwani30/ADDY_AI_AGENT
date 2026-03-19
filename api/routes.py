@@ -1,9 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import time
+import traceback
 import uuid
 
 import requests
@@ -90,7 +91,10 @@ async def telegram_webhook(request: Request):
         )
 
     except Exception as exc:
-        reply_text = "Temporary server error. Please try again."
+        print(f"ERROR: {exc}")
+        traceback.print_exc()
+
+        reply_text = f"Error: {exc}"
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         _log(
@@ -100,6 +104,7 @@ async def telegram_webhook(request: Request):
             tool_name=None,
             latency_ms=latency_ms,
             error_type=type(exc).__name__,
+            error_message=str(exc),
         )
 
     # Send reply back to Telegram

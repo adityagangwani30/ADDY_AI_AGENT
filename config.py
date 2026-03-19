@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -49,3 +49,24 @@ CLIENT_SECRET_FILE = Path(_env("CLIENT_SECRET_FILE", str(BASE_DIR / "client_secr
 MEMORY_DB_PATH = Path(_env("MEMORY_DB_PATH", str(BASE_DIR / "memory" / "assistant_memory.db")))
 
 WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
+
+
+# --------------- Startup validation ---------------
+# Warn loudly about missing critical env vars so Render deployments fail fast.
+
+import sys as _sys
+
+_CRITICAL_VARS = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "GEMINI_API_KEY": GEMINI_API_KEY,
+}
+
+for _name, _value in _CRITICAL_VARS.items():
+    if not _value:
+        print(f"WARNING: {_name} is not set. The application will not function correctly.", file=_sys.stderr)
+
+if not _env("ACCOUNTS_JSON"):
+    print(
+        "WARNING: ACCOUNTS_JSON is not set. Google account credentials will be unavailable.",
+        file=_sys.stderr,
+    )
