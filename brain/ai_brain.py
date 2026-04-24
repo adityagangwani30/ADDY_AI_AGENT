@@ -21,6 +21,7 @@ from threading import Lock
 from typing import Any
 
 from pydantic import ValidationError
+from pydantic_core import PydanticUndefined
 
 from auth.google_auth_manager import list_available_accounts
 from brain.llm_provider import FALLBACK_MESSAGE, call_llm
@@ -52,10 +53,214 @@ TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
 MAX_LLM_CALLS_PER_REQUEST = 4
 MAX_GMAIL_RESULTS = 50
+DEFAULT_EMAIL_PARAMS = {
+    "query": "in:inbox",
+    "max_results": 5,
+}
+GLOBAL_FALLBACK_RESPONSE = (
+    "⚠️ I couldn’t process that request properly. Please try again."
+)
 
 
 def _log(level: int, **payload: Any) -> None:
     LOGGER.log(level, json.dumps(payload, default=str))
+
+
+def normalize_email_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(DEFAULT_EMAIL_PARAMS)
+    incoming = dict(params or {})
+
+    query = str(incoming.get("query", "") or "").strip()
+    normalized["query"] = query or DEFAULT_EMAIL_PARAMS["query"]
+
+    max_results = incoming.get("max_results", DEFAULT_EMAIL_PARAMS["max_results"])
+    try:
+        normalized["max_results"] = max(1, min(int(max_results), MAX_GMAIL_RESULTS))
+    except (TypeError, ValueError):
+        normalized["max_results"] = DEFAULT_EMAIL_PARAMS["max_results"]
+
+    return normalized
+
+
+def _schema_default_data(schema: Any) -> dict[str, Any]:
+    defaults: dict[str, Any] = {}
+    model_fields = getattr(schema, "model_fields", {}) or {}
+    for name, field in model_fields.items():
+        default = getattr(field, "default", PydanticUndefined)
+        default_factory = getattr(field, "default_factory", None)
+        if default is not PydanticUndefined:
+            defaults[name] = default
+        elif callable(default_factory):
+            try:
+                defaults[name] = default_factory()
+            except Exception:
+                continue
+    return defaults
+
+
+def safe_validate(schema: Any, data: dict[str, Any] | None, default_data: dict[str, Any] | None) -> dict[str, Any]:
+    candidate = dict(data or {})
+    fallback = dict(default_data or _schema_default_data(schema))
+
+    try:
+        validated = schema.model_validate(candidate)
+        normalized = validated.model_dump(exclude_none=True)
+        _log(
+            logging.INFO,
+            event="validation_success",
+            schema=getattr(schema, "__name__", str(schema)),
+            normalized=normalized,
+            fallback_used=False,
+        )
+        return normalized
+    except Exception as exc:
+        _log(
+            logging.WARNING,
+            event="validation_failed",
+            schema=getattr(schema, "__name__", str(schema)),
+            candidate=candidate,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+    try:
+        validated = schema.model_validate(fallback)
+        normalized = validated.model_dump(exclude_none=True)
+        _log(
+            logging.INFO,
+            event="validation_fallback_used",
+            schema=getattr(schema, "__name__", str(schema)),
+            normalized=normalized,
+            fallback_used=True,
+        )
+        return normalized
+    except Exception as exc:
+        _log(
+            logging.ERROR,
+            event="validation_fallback_failed",
+            schema=getattr(schema, "__name__", str(schema)),
+            fallback=fallback,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        return fallback
+
+
+def _tool_default_params(tool_name: str) -> dict[str, Any]:
+    if tool_name in {"list_emails", "search_email"}:
+        return dict(DEFAULT_EMAIL_PARAMS)
+    schema = TOOL_PARAMETER_MODELS.get(tool_name)
+    return _schema_default_data(schema) if schema else {}
+
+
+def _simplified_email_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    simplified = normalize_email_params(params)
+    simplified["query"] = DEFAULT_EMAIL_PARAMS["query"]
+    simplified["max_results"] = min(simplified.get("max_results", 1), 1)
+    return simplified
+
+
+def _normalize_tool_params(tool_name: str, params: dict[str, Any] | None) -> dict[str, Any]:
+    if tool_name in {"list_emails", "search_email"}:
+        return normalize_email_params(params)
+    return dict(params or {})
+
+
+def safe_tool_call(
+    tool_fn: Any,
+    params: dict[str, Any] | None,
+    default_params: dict[str, Any] | None,
+    *,
+    account: str,
+    request_id: str = "unknown",
+    tool_name: str | None = None,
+) -> dict[str, Any]:
+    name = tool_name or getattr(tool_fn, "__name__", "unknown_tool")
+    primary = dict(params or {})
+    defaults = dict(default_params or {})
+    attempts: list[dict[str, Any]] = [primary]
+    if defaults and defaults != primary:
+        attempts.append(defaults)
+    if name in {"list_emails", "search_email"}:
+        simplified = _simplified_email_params(primary)
+        if simplified not in attempts:
+            attempts.append(simplified)
+
+    last_error: str | None = None
+    started = time.perf_counter()
+    signature = inspect.signature(tool_fn)
+
+    for attempt_index, attempt_params in enumerate(attempts, start=1):
+        _log(
+            logging.INFO,
+            event="tool_input",
+            request_id=request_id,
+            tool_name=name,
+            attempt=attempt_index,
+            params=attempt_params,
+        )
+        try:
+            call_kwargs = dict(attempt_params)
+            if "request_id" in signature.parameters:
+                call_kwargs["request_id"] = request_id
+            future = _TOOL_EXECUTOR.submit(tool_fn, account, **call_kwargs)
+            result = future.result(timeout=TOOL_TIMEOUT_SECONDS)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            _log(
+                logging.INFO,
+                event="tool_call_success",
+                request_id=request_id,
+                tool_name=name,
+                attempt=attempt_index,
+                latency_ms=latency_ms,
+                error_type=None,
+            )
+            return {
+                "ok": True,
+                "result": result,
+                "error": None,
+                "attempt": attempt_index,
+                "params_used": attempt_params,
+                "latency_ms": latency_ms,
+            }
+        except FuturesTimeoutError as exc:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            last_error = str(exc)
+            _log(
+                logging.ERROR,
+                event="tool_call_failed",
+                request_id=request_id,
+                tool_name=name,
+                attempt=attempt_index,
+                error_type="TimeoutError",
+                error_message=f"Tool '{name}' timed out after {TOOL_TIMEOUT_SECONDS} seconds.",
+                params=attempt_params,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            _log(
+                logging.ERROR,
+                event="tool_call_failed",
+                request_id=request_id,
+                tool_name=name,
+                attempt=attempt_index,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                params=attempt_params,
+            )
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "ok": False,
+        "result": None,
+        "error": last_error or GLOBAL_FALLBACK_RESPONSE,
+        "attempt": len(attempts),
+        "params_used": attempts[-1] if attempts else {},
+        "latency_ms": latency_ms,
+    }
 
 
 class _DailyLLMLimiter:
@@ -104,21 +309,49 @@ def execute_tool(
     Returns:
         A dict with ``latency_ms`` (int) and ``result`` (tool's return value).
 
-    Raises:
-        ValueError: If the tool is not registered.
-        TimeoutError: If the tool exceeds ``TOOL_TIMEOUT_SECONDS``.
-        RuntimeError: If the tool raises any other exception.
+    Returns a structured result and never raises for validation or tool errors.
     """
-    if tool_name not in TOOLS:
-        raise ValueError(f"Tool '{tool_name}' is not registered.")
-
     started = time.perf_counter()
-    tool_fn = TOOLS[tool_name]
-    call_kwargs = dict(parameters)
+    if tool_name not in TOOLS:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        _log(
+            logging.ERROR,
+            event="tool_error",
+            request_id=request_id,
+            tool_name=tool_name,
+            latency_ms=latency_ms,
+            error_type="ToolNotRegistered",
+            error_message=f"Tool '{tool_name}' is not registered.",
+        )
+        return {
+            "latency_ms": latency_ms,
+            "ok": False,
+            "result": None,
+            "error": GLOBAL_FALLBACK_RESPONSE,
+            "attempt": 0,
+            "params_used": {},
+        }
 
-    signature = inspect.signature(tool_fn)
-    if "request_id" in signature.parameters:
-        call_kwargs["request_id"] = request_id
+    tool_fn = TOOLS[tool_name]
+    schema = TOOL_PARAMETER_MODELS.get(tool_name)
+    normalized_params = _normalize_tool_params(tool_name, parameters)
+    default_params = _tool_default_params(tool_name)
+    validated_params = safe_validate(
+        schema,
+        normalized_params,
+        default_params,
+    ) if schema else normalized_params
+
+    _log(
+        logging.INFO,
+        event="tool_normalized_params",
+        request_id=request_id,
+        tool_name=tool_name,
+        latency_ms=None,
+        error_type=None,
+        normalized_params=validated_params,
+        default_params=default_params,
+    )
 
     _log(
         logging.INFO,
@@ -129,21 +362,15 @@ def execute_tool(
         error_type=None,
     )
 
-    future = _TOOL_EXECUTOR.submit(tool_fn, account, **call_kwargs)
     try:
-        result = future.result(timeout=TOOL_TIMEOUT_SECONDS)
-    except FuturesTimeoutError as exc:
-        future.cancel()
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        _log(
-            logging.ERROR,
-            event="tool_timeout",
+        call_result = safe_tool_call(
+            tool_fn,
+            validated_params,
+            default_params,
+            account=account,
             request_id=request_id,
             tool_name=tool_name,
-            latency_ms=latency_ms,
-            error_type="TimeoutError",
         )
-        raise TimeoutError("That request is taking longer than expected. Please try again.") from exc
     except Exception as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         _log(
@@ -153,8 +380,16 @@ def execute_tool(
             tool_name=tool_name,
             latency_ms=latency_ms,
             error_type=type(exc).__name__,
+            error_message=str(exc),
         )
-        raise RuntimeError(f"Tool '{tool_name}' failed: {exc}") from exc
+        return {
+            "latency_ms": latency_ms,
+            "ok": False,
+            "result": None,
+            "error": GLOBAL_FALLBACK_RESPONSE,
+            "attempt": 0,
+            "params_used": validated_params,
+        }
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     _log(
@@ -163,9 +398,10 @@ def execute_tool(
         request_id=request_id,
         tool_name=tool_name,
         latency_ms=latency_ms,
-        error_type=None,
+        error_type=None if call_result.get("ok") else "ToolRetryFailed",
     )
-    return {"latency_ms": latency_ms, "result": result}
+    call_result["latency_ms"] = latency_ms
+    return call_result
 
 
 class SecureHybridAgent:
@@ -189,7 +425,7 @@ class SecureHybridAgent:
     def run(self, user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
         rid = request_id or str(uuid.uuid4())
         started = time.perf_counter()
-        cleaned = user_message.strip()
+        cleaned = (user_message or "").strip()
         _log(logging.INFO, event="agent_start", request_id=rid,
              tool_name=None, latency_ms=None, error_type=None)
 
@@ -395,6 +631,16 @@ class SecureHybridAgent:
             request_id=request_id, phase="planner",
             timeout_seconds=LLM_TIMEOUT_SECONDS)
 
+        _log(
+            logging.INFO,
+            event="planner_llm_output",
+            request_id=request_id,
+            tool_name="planner",
+            latency_ms=None,
+            error_type=None,
+            output=text,
+        )
+
         if not text:
             return {"task_type": "direct_answer",
                     "direct_response": FALLBACK_MODEL_MESSAGE}
@@ -470,14 +716,26 @@ class SecureHybridAgent:
                              request_id: str
                              ) -> tuple[Any, int, str | None]:
         try:
-            r = execute_tool(tool_name=tool_name, account=account,
-                             parameters=parameters, request_id=request_id)
-            return r["result"], r["latency_ms"], None
-        except TimeoutError:
-            return None, 0, ("That request is taking longer than expected."
-                             " Please try again.")
+            r = execute_tool(
+                tool_name=tool_name,
+                account=account,
+                parameters=parameters,
+                request_id=request_id,
+            )
+            if r.get("ok"):
+                return r.get("result"), int(r.get("latency_ms", 0)), None
+            return None, int(r.get("latency_ms", 0)), str(r.get("error") or GLOBAL_FALLBACK_RESPONSE)
         except Exception as exc:
-            return None, 0, str(exc)
+            _log(
+                logging.ERROR,
+                event="tool_error",
+                request_id=request_id,
+                tool_name=tool_name,
+                latency_ms=None,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            return None, 0, GLOBAL_FALLBACK_RESPONSE
 
     # ── Confirmation ───────────────────────────────────────────────────
 
@@ -644,21 +902,57 @@ class SecureHybridAgent:
 
     def _validate_tool_call(self, tool_name: str, account: str,
                             parameters: dict[str, Any]) -> dict[str, Any]:
-        if tool_name not in TOOLS:
-            raise ValueError(f"Tool '{tool_name}' not allowlisted.")
-        if account not in list_available_accounts():
-            raise ValueError(f"Account '{account}' is invalid.")
-        model_cls = TOOL_PARAMETER_MODELS.get(tool_name)
-        if not model_cls:
-            raise ValueError(f"No schema for '{tool_name}'.")
         normalized = dict(parameters or {})
-        if tool_name in {"list_emails", "search_email"} and "max_results" in normalized:
-            normalized["max_results"] = self._clamp_max_results(normalized["max_results"])
-        try:
-            v = model_cls.model_validate(normalized)
-        except ValidationError as exc:
-            raise ValueError(f"Invalid parameters: {exc}") from exc
-        return v.model_dump(exclude_none=True)
+        default_data = _tool_default_params(tool_name)
+
+        if tool_name not in TOOLS:
+            _log(
+                logging.ERROR,
+                event="validation_failed",
+                request_id="unknown",
+                tool_name=tool_name,
+                candidate=normalized,
+                error_type="ToolNotRegistered",
+                error_message=f"Tool '{tool_name}' not allowlisted.",
+            )
+            return default_data
+
+        if account not in list_available_accounts():
+            _log(
+                logging.ERROR,
+                event="validation_failed",
+                request_id="unknown",
+                tool_name=tool_name,
+                candidate=normalized,
+                error_type="InvalidAccount",
+                error_message=f"Account '{account}' is invalid.",
+            )
+            return default_data
+
+        schema = TOOL_PARAMETER_MODELS.get(tool_name)
+        if not schema:
+            _log(
+                logging.WARNING,
+                event="validation_no_schema",
+                request_id="unknown",
+                tool_name=tool_name,
+                candidate=normalized,
+            )
+            return default_data
+
+        if tool_name in {"list_emails", "search_email"}:
+            normalized = normalize_email_params(normalized)
+
+        validated = safe_validate(schema, normalized, default_data)
+        _log(
+            logging.INFO,
+            event="validation_normalized",
+            request_id="unknown",
+            tool_name=tool_name,
+            normalized=validated,
+            default_data=default_data,
+        )
+        return validated
 
     # ── Utility ────────────────────────────────────────────────────────
 
@@ -747,5 +1041,39 @@ _AGENT = SecureHybridAgent()
 def run_agent(user_message: str, session_id: str,
               request_id: str | None = None) -> AgentResult:
     """Module-level entry point. Called by FastAPI via asyncio.to_thread."""
-    return _AGENT.run(user_message, session_id, request_id)
+    rid = request_id or str(uuid.uuid4())
+    try:
+        result = _AGENT.run(user_message, session_id, request_id)
+        if isinstance(result, AgentResult):
+            return result
+        _log(
+            logging.ERROR,
+            event="agent_run_failed",
+            request_id=rid,
+            tool_name=None,
+            latency_ms=None,
+            error_type="InvalidAgentResult",
+        )
+        return AgentResult(
+            request_id=rid,
+            status="error",
+            message=GLOBAL_FALLBACK_RESPONSE,
+            error_type="InvalidAgentResult",
+        )
+    except Exception as exc:
+        _log(
+            logging.ERROR,
+            event="agent_run_failed",
+            request_id=rid,
+            tool_name=None,
+            latency_ms=None,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        return AgentResult(
+            request_id=rid,
+            status="error",
+            message=GLOBAL_FALLBACK_RESPONSE,
+            error_type=type(exc).__name__,
+        )
 

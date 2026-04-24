@@ -47,7 +47,10 @@ Rules:
 - requires_refinement: true only for complex multi-step outputs
 - NEVER invent accounts or parameters
 - For Gmail fetch tools, always keep max_results between 1 and 50 inclusive.
+- For Gmail fetch tools, never return an empty query.
+- If the user is unsure or does not specify a query, use "in:inbox".
 - For email listings, prefer the newest messages first when the user asks for the last or latest email.
+- If unsure about Gmail parameters, use the default email params: {"query": "in:inbox", "max_results": 5}.
 
 Account selection rules (CRITICAL):
 - ALWAYS use the preferred account if one is set

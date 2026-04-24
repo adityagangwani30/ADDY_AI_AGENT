@@ -11,7 +11,7 @@ import requests
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from brain.ai_brain import run_agent
+from brain.ai_brain import GLOBAL_FALLBACK_RESPONSE, run_agent
 from config import TELEGRAM_BOT_TOKEN
 
 router = APIRouter()
@@ -178,4 +178,4 @@ async def _run_agent_safe(
             error_type=type(exc).__name__,
             error_message=str(exc),
         )
-        return f"Error: {exc}"
+        return GLOBAL_FALLBACK_RESPONSE
