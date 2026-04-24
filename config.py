@@ -29,9 +29,11 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")
 
-GEMINI_API_KEY = _env("GEMINI_API_KEY")
-GEMINI_MODEL_PRIMARY = _env("GEMINI_MODEL_PRIMARY", "gemini-2.5-flash")
-GEMINI_MODEL_FALLBACKS = _env_list("GEMINI_MODEL_FALLBACKS", ["gemini-2.0-flash"])
+GROQ_API_KEY = _env("GROQ_API_KEY")
+GROQ_MODEL = _env("GROQ_MODEL", "llama-3.3-70b-versatile")
+NVIDIA_API_KEY = _env("NVIDIA_API_KEY")
+NVIDIA_MODEL = _env("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
+LLM_TIMEOUT_SECONDS = int(_env("LLM_TIMEOUT_SECONDS", "15"))
 TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
 GOOGLE_CLIENT_ID = _env("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = _env("GOOGLE_CLIENT_SECRET")
@@ -55,7 +57,7 @@ WEBHOOK_SECRET = _env("WEBHOOK_SECRET")
 
 _CRITICAL_VARS = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "GROQ_API_KEY": GROQ_API_KEY,
 }
 
 for _name, _value in _CRITICAL_VARS.items():

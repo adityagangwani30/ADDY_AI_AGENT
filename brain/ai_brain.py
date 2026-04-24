@@ -2,8 +2,9 @@
 Core AI agent for the personal assistant.
 
 Contains ``SecureHybridAgent``, which routes user messages either to direct
-tool execution (fast heuristic path) or to Google Gemini for natural-language
-tool planning. Also exposes ``execute_tool`` and the module-level ``run_agent``
+tool execution (fast heuristic path) or to a dual-provider LLM layer
+(Groq primary → NVIDIA fallback) for natural-language tool planning.
+Also exposes ``execute_tool`` and the module-level ``run_agent``
 entry point used by the FastAPI route handler.
 """
 from __future__ import annotations
@@ -19,28 +20,24 @@ from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
-from google import genai
-from google.genai import types
 from pydantic import ValidationError
 
 from auth.google_auth_manager import list_available_accounts
+from brain.llm_provider import FALLBACK_MESSAGE, call_llm
 from brain.system_prompt import GENERAL_ANSWER_SYSTEM_PROMPT, SUMMARIZATION_SYSTEM_PROMPT
 from brain.tool_registry import DESTRUCTIVE_TOOLS, TOOLS, TOOL_PARAMETER_MODELS
-from config import GEMINI_API_KEY
+from config import LLM_TIMEOUT_SECONDS
 from domain.schemas import AgentDecision, AgentResult
 from memory.storage import SQLiteMemoryRepository
 
 LOGGER = logging.getLogger(__name__)
 
-_GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent-gemini")
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agent-tools")
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
-FALLBACK_MODEL_MESSAGE = "I'm having trouble accessing my reasoning model right now. Please try again."
+FALLBACK_MODEL_MESSAGE = FALLBACK_MESSAGE
 DAILY_LIMIT_MESSAGE = "Daily AI limit reached. Please try again tomorrow."
-DAILY_GEMINI_CALL_LIMIT = 100
+DAILY_LLM_CALL_LIMIT = 100
 
-GEMINI_ANSWER_TIMEOUT_SECONDS = 15
 TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
 MAX_LLM_CALLS_PER_REQUEST = 2
@@ -50,7 +47,7 @@ def _log(level: int, **payload: Any) -> None:
     LOGGER.log(level, json.dumps(payload, default=str))
 
 
-class _DailyGeminiLimiter:
+class _DailyLLMLimiter:
     def __init__(self, limit: int) -> None:
         self._limit = limit
         self._lock = Lock()
@@ -75,7 +72,7 @@ class _DailyGeminiLimiter:
             return self._day_utc.isoformat(), self._count, self._limit
 
 
-_DAILY_GEMINI_LIMITER = _DailyGeminiLimiter(DAILY_GEMINI_CALL_LIMIT)
+_DAILY_LLM_LIMITER = _DailyLLMLimiter(DAILY_LLM_CALL_LIMIT)
 
 
 def execute_tool(
@@ -167,7 +164,7 @@ class SecureHybridAgent:
     2) Conditional multi-step LLM pipeline:
        - Fast path: direct tool execution for simple queries (no LLM)
        - Smart path: tool execution → LLM summarization for reasoning queries
-    3) Max 2 Gemini calls per user message
+    3) Max 2 LLM calls per user message (Groq primary → NVIDIA fallback)
     4) Deterministic fallback when LLM is unavailable
     """
 
@@ -181,18 +178,17 @@ class SecureHybridAgent:
 
     def __init__(self) -> None:
         self.memory_repo = SQLiteMemoryRepository()
-        self._genai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-        self._daily_limiter = _DAILY_GEMINI_LIMITER
+        self._daily_limiter = _DAILY_LLM_LIMITER
 
     def run(self, user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
         """
         Process a user message and return an ``AgentResult``.
 
         Routing order:
-        1. Account overview shortcut (no tool / no Gemini call).
+        1. Account overview shortcut (no tool / no LLM call).
         2. Confirmation / cancellation of pending destructive actions.
-        3. Heuristic intent detection → direct tool execution (no Gemini call).
-        4. Gemini tool planner → validated tool execution.
+        3. Heuristic intent detection → direct tool execution (no LLM call).
+        4. LLM tool planner → validated tool execution.
 
         Args:
             user_message: Raw text message from the user.
@@ -246,7 +242,7 @@ class SecureHybridAgent:
         preferred_account = self.memory_repo.get_account_preference(session_id)
 
         if intent == "general_knowledge":
-            if not self._reserve_gemini_call(rid, "general_answer"):
+            if not self._reserve_llm_call(rid, "general_answer"):
                 return self._daily_limit_result(session_id, rid, started, None)
             llm_calls_used += 1
 
@@ -257,7 +253,7 @@ class SecureHybridAgent:
 
         decision = self._build_direct_tool_decision(lower, preferred_account)
         if decision is None:
-            if not self._reserve_gemini_call(rid, "tool_planning"):
+            if not self._reserve_llm_call(rid, "tool_planning"):
                 return self._daily_limit_result(session_id, rid, started, None)
             llm_calls_used += 1
             decision = self._plan_tool_decision(cleaned, history, preferred_account, intent, rid)
@@ -324,9 +320,9 @@ class SecureHybridAgent:
         self._log_agent_finish(rid, started, tool_name, result.error_type)
         return result
 
-    def _reserve_gemini_call(self, request_id: str, phase: str) -> bool:
+    def _reserve_llm_call(self, request_id: str, phase: str) -> bool:
         """
-        Attempt to consume one Gemini quota unit for the current UTC day.
+        Attempt to consume one LLM quota unit for the current UTC day.
 
         Returns:
             ``True`` if the call is allowed, ``False`` if the daily limit is reached.
@@ -335,7 +331,7 @@ class SecureHybridAgent:
         day_utc, count, limit = self._daily_limiter.snapshot()
         _log(
             logging.INFO,
-            event="gemini_quota_check",
+            event="llm_quota_check",
             request_id=request_id,
             tool_name=phase,
             day_utc=day_utc,
@@ -484,12 +480,12 @@ class SecureHybridAgent:
 
     def _answer_general(self, user_message: str, history: list[dict[str, str]], request_id: str) -> str:
         history_tail = "\n".join(f"{h['role']}: {h['content']}" for h in history[-4:])
-        answer = self._call_gemini_with_fallback(
-            system_instruction=GENERAL_ANSWER_SYSTEM_PROMPT,
-            user_message=f"Recent context:\n{history_tail}\n\nUser question: {user_message}",
+        answer = call_llm(
+            prompt=f"Recent context:\n{history_tail}\n\nUser question: {user_message}",
+            system_prompt=GENERAL_ANSWER_SYSTEM_PROMPT,
             request_id=request_id,
             phase="general_answer",
-            timeout_seconds=GEMINI_ANSWER_TIMEOUT_SECONDS,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
         )
         return answer or FALLBACK_MODEL_MESSAGE
 
@@ -501,7 +497,7 @@ class SecureHybridAgent:
         """
         Attempt to build a tool decision purely from keyword heuristics.
 
-        Skips the Gemini planner entirely when a known pattern is found.
+        Skips the LLM planner entirely when a known pattern is found.
         Requires a ``preferred_account`` to be set (from previous session context).
 
         Returns:
@@ -583,12 +579,12 @@ class SecureHybridAgent:
             f"User request: {user_message}"
         )
 
-        text = self._call_gemini_with_fallback(
-            system_instruction=planner_prompt,
-            user_message=planner_input,
+        text = call_llm(
+            prompt=planner_input,
+            system_prompt=planner_prompt,
             request_id=request_id,
             phase="tool_planning",
-            timeout_seconds=GEMINI_ANSWER_TIMEOUT_SECONDS,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
         )
         if not text:
             return None
@@ -598,185 +594,9 @@ class SecureHybridAgent:
         except ValueError:
             return None
 
-    def _call_gemini_with_fallback(
-        self,
-        system_instruction: str,
-        user_message: str,
-        request_id: str,
-        phase: str,
-        timeout_seconds: int,
-    ) -> str | None:
-        """
-        Call the Gemini API with automatic model fallback.
-
-        Tries each model in ``GEMINI_MODELS`` in order.  Handles
-        ``request_options`` ``TypeError`` for older SDK versions, ``TimeoutError``,
-        and general API errors.  Returns ``None`` only when all models fail.
-
-        Args:
-            system_instruction: System prompt to guide model behaviour.
-            user_message: The user's query or planner input.
-            request_id: Trace ID for structured logging.
-            phase: Label for the current call phase (e.g. ``"tool_planning"``).
-            timeout_seconds: Wall-clock timeout enforced via thread future.
-
-        Returns:
-            Raw text from the model, or ``None`` on total failure.
-        """
-        if self._genai_client is None:
-            _log(
-                logging.ERROR,
-                event="gemini_unavailable",
-                request_id=request_id,
-                tool_name=phase,
-                latency_ms=0,
-                error_type="MissingAPIKey",
-            )
-            return None
-
-        last_error: Exception | None = None
-
-        for model_name in GEMINI_MODELS:
-            started = time.perf_counter()
-            _log(
-                logging.INFO,
-                event="gemini_start",
-                request_id=request_id,
-                tool_name=phase,
-                model_name=model_name,
-                latency_ms=None,
-                error_type=None,
-            )
-
-            future = _GEMINI_EXECUTOR.submit(
-                self._genai_client.models.generate_content,
-                model=model_name,
-                contents=user_message,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.1,
-                ),
-                request_options={"timeout": timeout_seconds},
-            )
-
-            try:
-                response = future.result(timeout=timeout_seconds)
-            except TypeError as exc:
-                if "request_options" not in str(exc):
-                    last_error = exc
-                    continue
-
-                fallback_future = _GEMINI_EXECUTOR.submit(
-                    self._genai_client.models.generate_content,
-                    model=model_name,
-                    contents=user_message,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.1,
-                    ),
-                )
-                try:
-                    response = fallback_future.result(timeout=timeout_seconds)
-                except Exception as inner_exc:
-                    fallback_future.cancel()
-                    last_error = inner_exc
-                    latency_ms = int((time.perf_counter() - started) * 1000)
-                    _log(
-                        logging.ERROR,
-                        event="gemini_error",
-                        request_id=request_id,
-                        tool_name=phase,
-                        model_name=model_name,
-                        latency_ms=latency_ms,
-                        error_type=type(inner_exc).__name__,
-                    )
-                    continue
-            except FuturesTimeoutError as exc:
-                future.cancel()
-                last_error = exc
-                latency_ms = int((time.perf_counter() - started) * 1000)
-                _log(
-                    logging.ERROR,
-                    event="gemini_timeout",
-                    request_id=request_id,
-                    tool_name=phase,
-                    model_name=model_name,
-                    latency_ms=latency_ms,
-                    error_type="TimeoutError",
-                )
-                continue
-            except Exception as exc:
-                last_error = exc
-                latency_ms = int((time.perf_counter() - started) * 1000)
-                _log(
-                    logging.ERROR,
-                    event="gemini_error",
-                    request_id=request_id,
-                    tool_name=phase,
-                    model_name=model_name,
-                    latency_ms=latency_ms,
-                    error_type=type(exc).__name__,
-                )
-                continue
-
-            text = self._extract_text(response)
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            _log(
-                logging.INFO,
-                event="gemini_finish",
-                request_id=request_id,
-                tool_name=phase,
-                model_name=model_name,
-                latency_ms=latency_ms,
-                error_type=None,
-            )
-            if text:
-                return text.strip()
-
-        _log(
-            logging.ERROR,
-            event="gemini_fallback_failed",
-            request_id=request_id,
-            tool_name=phase,
-            latency_ms=None,
-            error_type=type(last_error).__name__ if last_error else "UnknownError",
-        )
-        return None
-
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        """
-        Safely extract text content from a Gemini API response object.
-
-        Handles both the top-level ``.text`` shortcut and the nested
-        ``candidates → content → parts`` structure.
-
-        Returns:
-            The extracted text string, or an empty string if nothing is found.
-        """
-        text = getattr(response, "text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        candidates = getattr(response, "candidates", None)
-        if not candidates:
-            return ""
-
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None) if content else None
-            if not parts:
-                continue
-            for part in parts:
-                part_text = getattr(part, "text", None)
-                if isinstance(part_text, str) and part_text.strip():
-                    return part_text.strip()
-
-        return ""
-
     def _parse_decision(self, llm_text: str) -> AgentDecision:
         """
-        Parse a JSON tool-decision string returned by the Gemini planner.
+        Parse a JSON tool-decision string returned by the LLM planner.
 
         Strips optional markdown fences and extracts the first JSON object
         found in the response.
@@ -928,7 +748,7 @@ class SecureHybridAgent:
         budget has not been exhausted.  Returns None on failure so the
         caller can fall back to deterministic formatting.
         """
-        if not self._reserve_gemini_call(request_id, "summarization"):
+        if not self._reserve_llm_call(request_id, "summarization"):
             _log(
                 logging.WARNING,
                 event="summarization_skipped",
@@ -952,12 +772,12 @@ class SecureHybridAgent:
             "- Be informative but not verbose"
         )
 
-        summary = self._call_gemini_with_fallback(
-            system_instruction=SUMMARIZATION_SYSTEM_PROMPT,
-            user_message=user_prompt,
+        summary = call_llm(
+            prompt=user_prompt,
+            system_prompt=SUMMARIZATION_SYSTEM_PROMPT,
             request_id=request_id,
             phase="summarization",
-            timeout_seconds=GEMINI_ANSWER_TIMEOUT_SECONDS,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
         )
         return summary or None
 
