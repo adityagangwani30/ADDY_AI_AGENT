@@ -24,6 +24,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 from auth.google_auth_manager import list_available_accounts
+from brain.system_prompt import GENERAL_ANSWER_SYSTEM_PROMPT, SUMMARIZATION_SYSTEM_PROMPT
 from brain.tool_registry import DESTRUCTIVE_TOOLS, TOOLS, TOOL_PARAMETER_MODELS
 from config import GEMINI_API_KEY
 from domain.schemas import AgentDecision, AgentResult
@@ -42,6 +43,7 @@ DAILY_GEMINI_CALL_LIMIT = 100
 GEMINI_ANSWER_TIMEOUT_SECONDS = 15
 TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
+MAX_LLM_CALLS_PER_REQUEST = 2
 
 
 def _log(level: int, **payload: Any) -> None:
@@ -160,11 +162,22 @@ def execute_tool(
 
 class SecureHybridAgent:
     """
-    Simplified architecture:
+    Smart hybrid architecture:
     1) Heuristic intent routing (no classification call)
-    2) Max one Gemini call per user message
-    3) Deterministic tool-result formatting (no summary call)
+    2) Conditional multi-step LLM pipeline:
+       - Fast path: direct tool execution for simple queries (no LLM)
+       - Smart path: tool execution → LLM summarization for reasoning queries
+    3) Max 2 Gemini calls per user message
+    4) Deterministic fallback when LLM is unavailable
     """
+
+    _REASONING_KEYWORDS = (
+        "summarize", "summarise", "summary", "analyze", "analyse", "analysis",
+        "compare", "explain", "insights", "insight", "important", "urgent",
+        "priority", "highlight", "overview", "brief", "digest", "recap",
+        "what's new", "what happened", "anything important", "any urgent",
+        "key takeaways", "action items", "today",
+    )
 
     def __init__(self) -> None:
         self.memory_repo = SQLiteMemoryRepository()
@@ -221,6 +234,7 @@ class SecureHybridAgent:
             return AgentResult(request_id=rid, status="ok", message="Pending action cancelled.")
 
         history = self.memory_repo.get_conversation(session_id, limit=MAX_HISTORY_MESSAGES)
+        llm_calls_used = 0
 
         alias_in_message = self._detect_account_alias(lower)
         if alias_in_message:
@@ -234,6 +248,7 @@ class SecureHybridAgent:
         if intent == "general_knowledge":
             if not self._reserve_gemini_call(rid, "general_answer"):
                 return self._daily_limit_result(session_id, rid, started, None)
+            llm_calls_used += 1
 
             answer = self._answer_general(cleaned, history, rid)
             self.memory_repo.add_conversation(session_id, "assistant", answer)
@@ -244,6 +259,7 @@ class SecureHybridAgent:
         if decision is None:
             if not self._reserve_gemini_call(rid, "tool_planning"):
                 return self._daily_limit_result(session_id, rid, started, None)
+            llm_calls_used += 1
             decision = self._plan_tool_decision(cleaned, history, preferred_account, intent, rid)
 
         if decision is None:
@@ -302,6 +318,8 @@ class SecureHybridAgent:
             tool_name=tool_name,
             account=account,
             parameters=validated,
+            user_message=cleaned,
+            llm_calls_used=llm_calls_used,
         )
         self._log_agent_finish(rid, started, tool_name, result.error_type)
         return result
@@ -372,6 +390,8 @@ class SecureHybridAgent:
         tool_name: str,
         account: str,
         parameters: dict[str, Any],
+        user_message: str = "",
+        llm_calls_used: int = 0,
     ) -> AgentResult:
         try:
             tool_response = execute_tool(
@@ -403,7 +423,34 @@ class SecureHybridAgent:
                 error_type=type(exc).__name__,
             )
 
-        summary = self._format_tool_result(tool_name, account, tool_response["result"])
+        raw_result = tool_response["result"]
+
+        # --- Smart path: LLM summarization when reasoning is needed ---
+        if (
+            user_message
+            and self._needs_reasoning(user_message.lower())
+            and llm_calls_used < MAX_LLM_CALLS_PER_REQUEST
+        ):
+            summary = self._summarize_tool_result(
+                user_message=user_message,
+                tool_name=tool_name,
+                tool_result=raw_result,
+                request_id=request_id,
+            )
+            if summary:
+                self.memory_repo.add_conversation(session_id, "assistant", summary)
+                return AgentResult(
+                    request_id=request_id,
+                    status="ok",
+                    message=summary,
+                    tool_name=tool_name,
+                    account=account,
+                    latency_ms=tool_response["latency_ms"],
+                    data=raw_result,
+                )
+
+        # --- Fast path: deterministic formatting ---
+        summary = self._format_tool_result(tool_name, account, raw_result)
         self.memory_repo.add_conversation(session_id, "assistant", summary)
         return AgentResult(
             request_id=request_id,
@@ -412,7 +459,7 @@ class SecureHybridAgent:
             tool_name=tool_name,
             account=account,
             latency_ms=tool_response["latency_ms"],
-            data=tool_response["result"],
+            data=raw_result,
         )
 
     _GMAIL_KEYWORDS = ("email", "emails", "mail", "mails", "gmail", "inbox", "unread", "message", "messages")
@@ -437,12 +484,8 @@ class SecureHybridAgent:
 
     def _answer_general(self, user_message: str, history: list[dict[str, str]], request_id: str) -> str:
         history_tail = "\n".join(f"{h['role']}: {h['content']}" for h in history[-4:])
-        system = (
-            "You are a helpful AI assistant. Answer directly and clearly. "
-            "Do not mention tool limitations. Keep responses concise unless detail is requested."
-        )
         answer = self._call_gemini_with_fallback(
-            system_instruction=system,
+            system_instruction=GENERAL_ANSWER_SYSTEM_PROMPT,
             user_message=f"Recent context:\n{history_tail}\n\nUser question: {user_message}",
             request_id=request_id,
             phase="general_answer",
@@ -787,6 +830,138 @@ class SecureHybridAgent:
             raise ValueError(f"Invalid parameters: {exc}") from exc
 
         return validated.model_dump(exclude_none=True)
+
+    # ── Smart reasoning detection ──────────────────────────────────────
+
+    def _needs_reasoning(self, lowered_message: str) -> bool:
+        """
+        Determine if the user's query requires LLM reasoning/summarization.
+
+        Uses keyword heuristics only (no LLM call). Returns True when the
+        message contains words implying summarization, analysis, or insight.
+        """
+        return any(kw in lowered_message for kw in self._REASONING_KEYWORDS)
+
+    # ── Data formatting for LLM consumption ────────────────────────────
+
+    def _format_data_for_llm(self, tool_name: str, tool_result: Any) -> str:
+        """
+        Convert raw tool result JSON into structured, human-readable text
+        suitable for passing into an LLM summarization prompt.
+
+        This avoids sending raw JSON blobs to the model, improving output
+        quality significantly.
+        """
+        if not isinstance(tool_result, dict):
+            return json.dumps(tool_result, default=str, indent=2)
+
+        if tool_name in ("list_emails", "search_email"):
+            messages = tool_result.get("messages", [])
+            if not messages:
+                return "No emails found."
+            lines = []
+            for i, msg in enumerate(messages, 1):
+                subject = msg.get("subject", msg.get("Subject", "No subject"))
+                sender = msg.get("from", msg.get("From", msg.get("sender", "Unknown")))
+                snippet = msg.get("snippet", msg.get("Snippet", ""))
+                date = msg.get("date", msg.get("Date", msg.get("internalDate", "")))
+                labels = msg.get("labelIds", [])
+                lines.append(
+                    f"Email {i}:\n"
+                    f"  - Subject: {subject}\n"
+                    f"  - From: {sender}\n"
+                    f"  - Date: {date}\n"
+                    f"  - Labels: {', '.join(labels) if labels else 'none'}\n"
+                    f"  - Snippet: {snippet}"
+                )
+            return f"Total: {tool_result.get('count', len(messages))} email(s)\n\n" + "\n\n".join(lines)
+
+        if tool_name == "list_events":
+            events = tool_result.get("events", [])
+            if not events:
+                return "No upcoming events found."
+            lines = []
+            for i, evt in enumerate(events, 1):
+                summary = evt.get("summary", "No title")
+                start = evt.get("start", {})
+                start_time = start.get("dateTime", start.get("date", "Unknown"))
+                end = evt.get("end", {})
+                end_time = end.get("dateTime", end.get("date", ""))
+                location = evt.get("location", "")
+                lines.append(
+                    f"Event {i}:\n"
+                    f"  - Title: {summary}\n"
+                    f"  - Start: {start_time}\n"
+                    f"  - End: {end_time}\n"
+                    + (f"  - Location: {location}\n" if location else "")
+                )
+            return f"Total: {tool_result.get('count', len(events))} event(s)\n\n" + "\n\n".join(lines)
+
+        if tool_name == "list_files":
+            files = tool_result.get("files", [])
+            if not files:
+                return "No files found."
+            lines = []
+            for i, f in enumerate(files, 1):
+                lines.append(f"File {i}: {f.get('name', 'Unknown')} (ID: {f.get('id', 'N/A')})")
+            return f"Total: {tool_result.get('count', len(files))} file(s)\n\n" + "\n".join(lines)
+
+        # Fallback: compact JSON
+        formatted = json.dumps(tool_result, default=str, indent=2)
+        if len(formatted) > 3000:
+            formatted = formatted[:3000] + "\n... (truncated)"
+        return formatted
+
+    # ── LLM summarization pipeline ─────────────────────────────────────
+
+    def _summarize_tool_result(
+        self,
+        user_message: str,
+        tool_name: str,
+        tool_result: Any,
+        request_id: str,
+    ) -> str | None:
+        """
+        Pass tool results through the LLM for intelligent summarization.
+
+        Only called when _needs_reasoning() returns True and the LLM call
+        budget has not been exhausted.  Returns None on failure so the
+        caller can fall back to deterministic formatting.
+        """
+        if not self._reserve_gemini_call(request_id, "summarization"):
+            _log(
+                logging.WARNING,
+                event="summarization_skipped",
+                request_id=request_id,
+                tool_name=tool_name,
+                latency_ms=0,
+                error_type="DailyLimitExceeded",
+            )
+            return None
+
+        formatted_data = self._format_data_for_llm(tool_name, tool_result)
+
+        user_prompt = (
+            f"User asked: {user_message}\n\n"
+            f"Here is the data retrieved:\n{formatted_data}\n\n"
+            "Your task:\n"
+            "- Identify the most important items\n"
+            "- Summarize clearly and concisely\n"
+            "- Highlight key insights, deadlines, or action items\n"
+            "- Use bullet points for readability\n"
+            "- Be informative but not verbose"
+        )
+
+        summary = self._call_gemini_with_fallback(
+            system_instruction=SUMMARIZATION_SYSTEM_PROMPT,
+            user_message=user_prompt,
+            request_id=request_id,
+            phase="summarization",
+            timeout_seconds=GEMINI_ANSWER_TIMEOUT_SECONDS,
+        )
+        return summary or None
+
+    # ── Deterministic tool-result formatting (fast path) ───────────────
 
     def _format_tool_result(self, tool_name: str, account: str, tool_result: Any) -> str:
         if tool_name == "list_emails":
