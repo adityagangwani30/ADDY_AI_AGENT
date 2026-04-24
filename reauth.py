@@ -28,7 +28,6 @@ if sys.stderr.encoding != "utf-8":
 import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 
 # ── Project imports ────────────────────────────────────────────────────
 
@@ -39,7 +38,12 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_TOKEN_URI
-from auth.google_auth_manager import ACCOUNTS_FILE, SCOPES
+from auth.google_auth_manager import (
+    ACCOUNTS_FILE,
+    SCOPES,
+    AuthReauthRequired,
+    authenticate_account as core_authenticate_account,
+)
 
 # Path to the OAuth client secrets file (installed app type)
 CREDENTIALS_FILE = ROOT / "credentials.json"
@@ -117,94 +121,7 @@ def check_all_accounts() -> dict[str, tuple[bool, str]]:
     return results
 
 
-# ── Core OAuth flow using InstalledAppFlow ─────────────────────────────
-
-def authenticate_account(email: str) -> dict:
-    """
-    Authenticate a Google account using the official InstalledAppFlow.
-
-    Opens browser automatically, handles redirect internally on localhost,
-    captures both access_token and refresh_token, and stores them in
-    accounts.json.
-
-    Args:
-        email: The email address to authenticate.
-
-    Returns:
-        Dict with email, access_token, refresh_token, and expiry.
-
-    Raises:
-        RuntimeError: If authentication fails or refresh_token is missing.
-        FileNotFoundError: If credentials.json is not found.
-    """
-    if not CREDENTIALS_FILE.exists():
-        raise FileNotFoundError(
-            f"credentials.json not found at {CREDENTIALS_FILE}.\n"
-            "Download it from Google Cloud Console > APIs & Services > Credentials."
-        )
-
-    print(f"\n{'='*60}")
-    print(f"  Authenticating: {email}")
-    print(f"{'='*60}\n")
-
-    # Initialize the InstalledAppFlow from client secrets
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(CREDENTIALS_FILE),
-        SCOPES,
-    )
-
-    print("Opening browser for Google sign-in...")
-    print(f"If the browser doesn't open, check http://localhost:{OAUTH_PORT}\n")
-
-    # Run the local server flow — opens browser, captures redirect automatically
-    creds = flow.run_local_server(
-        port=OAUTH_PORT,
-        prompt="consent",           # Force consent to ensure refresh_token
-        access_type="offline",      # Request offline access for refresh_token
-        login_hint=email,           # Pre-fill email in Google sign-in
-    )
-
-    # Extract tokens
-    access_token = creds.token
-    refresh_token = creds.refresh_token
-    expiry = creds.expiry.isoformat() if creds.expiry else None
-
-    # CRITICAL: Handle missing refresh_token
-    if not refresh_token:
-        print("\n⚠️  Refresh token missing. This usually means Google didn't")
-        print("   issue a new refresh token because prior consent still exists.\n")
-        print("   To fix this:")
-        print("   1. Go to https://myaccount.google.com/permissions")
-        print("   2. Find and remove this app's access")
-        print("   3. Run this script again\n")
-        raise RuntimeError(
-            "Refresh token missing. Revoke app access at "
-            "https://myaccount.google.com/permissions and retry."
-        )
-
-    # Build the account entry
-    account_entry = {
-        "token": access_token,
-        "refresh_token": refresh_token,
-        "token_uri": GOOGLE_TOKEN_URI,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes) if creds.scopes else SCOPES,
-        "expiry": expiry,
-    }
-
-    # Update accounts.json (replace existing, don't duplicate)
-    accounts = _load_accounts_local()
-    accounts[email] = account_entry
-    _save_accounts_local(accounts)
-    print(f"\n✅ Tokens saved to {ACCOUNTS_FILE}")
-
-    return {
-        "email": email,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expiry": expiry,
-    }
+authenticate_account = core_authenticate_account
 
 
 # ── Re-authentication (wraps authenticate_account with verification) ──
@@ -222,32 +139,23 @@ def reauthenticate_account(email: str) -> bool:
         True if successful, False otherwise.
     """
     try:
-        result = authenticate_account(email)
-    except (RuntimeError, FileNotFoundError) as exc:
+        authenticate_account(email)
+    except (RuntimeError, FileNotFoundError, AuthReauthRequired) as exc:
         print(f"\n❌ {exc}")
         return False
     except Exception as exc:
         print(f"\n❌ Unexpected error during authentication: {exc}")
         return False
 
-    # Verify the new tokens work
-    print("\nVerifying new tokens...")
-    accounts = _load_accounts_local()
-    account_data = accounts.get(email, {})
-    healthy, msg = check_account(email, account_data)
-    print(f"  {msg}")
+    try:
+        from tools.gmail_tools import list_emails
 
-    if healthy:
-        # Try a real API call
-        try:
-            from tools.gmail_tools import list_emails
-            api_result = list_emails(email, max_results=1)
-            count = api_result.get("count", 0) if isinstance(api_result, dict) else "?"
-            print(f"  ✅ Account connected successfully — {count} email(s) accessible")
-        except Exception as exc:
-            print(f"  ⚠️ Gmail test failed (tokens may still be valid): {exc}")
-
-    return healthy
+        list_emails(email, max_results=1)
+        print("\n✅ Account connected successfully")
+        return True
+    except Exception as exc:
+        print(f"\n⚠️ Your account needs re-authentication. Please reconnect. Verification failed: {exc}")
+        return False
 
 
 def reauthenticate_all_accounts(force: bool = False) -> None:

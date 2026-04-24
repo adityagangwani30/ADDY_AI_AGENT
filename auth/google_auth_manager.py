@@ -9,6 +9,7 @@ from typing import Any
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
+
+REAUTH_PROMPT = "⚠️ Your account needs re-authentication. Please reconnect."
 
 
 class AuthConfigurationError(RuntimeError):
@@ -65,11 +68,8 @@ def load_accounts() -> dict[str, Any]:
 
 
 def save_accounts(accounts: dict[str, Any]) -> None:
-    """Persist credentials locally (skip in cloud)."""
-    if os.getenv("ACCOUNTS_JSON"):
-        LOGGER.info("Skipping save — cloud environment (ACCOUNTS_JSON is set).")
-        return
-
+    """Persist credentials locally and keep ACCOUNTS_JSON in sync."""
+    os.environ["ACCOUNTS_JSON"] = json.dumps(accounts, separators=(",", ":"))
     try:
         ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as fh:
@@ -110,16 +110,13 @@ def is_account_invalid(account_name: str) -> bool:
 # ────────────────────────────────────────────
 
 
-def auto_authenticate(email: str) -> Credentials:
+def authenticate_account(email: str) -> dict[str, Any]:
     """
-    Run the InstalledAppFlow to re-authenticate an account.
+    Run the InstalledAppFlow to authenticate an account.
 
     Opens the browser, captures the redirect, and returns fresh Credentials.
     Also updates accounts.json.
     """
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from config import GOOGLE_TOKEN_URI
-
     if not CREDENTIALS_FILE.exists():
         raise FileNotFoundError(
             f"credentials.json not found at {CREDENTIALS_FILE}. "
@@ -142,16 +139,17 @@ def auto_authenticate(email: str) -> Credentials:
 
     if not creds.refresh_token:
         raise AuthReauthRequired(
-            f"Refresh token missing for '{email}'. "
-            "Revoke app access at https://myaccount.google.com/permissions and retry."
+            "Refresh token missing. Revoking old access and retrying. "
+            "Revoke app access at https://myaccount.google.com/permissions and retry the auth flow."
         )
 
     # Save to accounts.json
     accounts = load_accounts()
     accounts[email] = {
-        "token": creds.token,
+        "email": email,
+        "access_token": creds.token,
         "refresh_token": creds.refresh_token,
-        "token_uri": GOOGLE_TOKEN_URI,
+        "token_uri": creds.token_uri,
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes) if creds.scopes else SCOPES,
@@ -165,7 +163,34 @@ def auto_authenticate(email: str) -> Credentials:
     save_accounts(accounts)
     LOGGER.info("Successfully authenticated '%s' and saved tokens.", email)
 
-    return creds
+    return {
+        "email": email,
+        "access_token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
+    }
+
+
+def reauthenticate_account(email: str) -> dict[str, Any]:
+    """Re-authenticate an account and verify access with Gmail."""
+    result = authenticate_account(email)
+
+    try:
+        from tools.gmail_tools import list_emails
+
+        list_emails(email, max_results=1)
+    except Exception as exc:
+        mark_account_invalid(email)
+        raise AuthReauthRequired(
+            f"{REAUTH_PROMPT} Verification failed for '{email}': {exc}"
+        ) from exc
+
+    LOGGER.info("✅ Account connected successfully for '%s'.", email)
+    return result
+
+
+# Backward-compatible alias for older imports.
+auto_authenticate = authenticate_account
 
 
 # ────────────────────────────────────────────
@@ -190,8 +215,7 @@ def get_credentials(account_name: str) -> Credentials:
     # Check if account is already flagged as invalid
     if is_account_invalid(account_name):
         raise AuthReauthRequired(
-            f"⚠️ Account '{account_name}' needs re-authentication. "
-            "Please reconnect by running: python reauth.py --email " + account_name
+            f"{REAUTH_PROMPT} Account '{account_name}' is marked invalid."
         )
 
     accounts = load_accounts()
@@ -220,8 +244,7 @@ def get_credentials(account_name: str) -> Credentials:
         # Auto-recovery: mark account as invalid and raise
         mark_account_invalid(account_name)
         raise AuthReauthRequired(
-            f"⚠️ Your account '{account_name}' needs re-authentication. "
-            "Please reconnect by running: python reauth.py --email " + account_name
+            f"Token refresh failed. {REAUTH_PROMPT} Account '{account_name}' needs re-authentication."
         )
 
     # Persist updated token (locally only)
@@ -241,40 +264,43 @@ def _build_credentials_from_stored(
 ) -> Credentials | None:
     """Build Credentials from stored JSON data (supports old and new format)."""
 
-    # New format: full credential object (has client_id or token)
-    if "client_id" in account_data or "token" in account_data:
-        # Filter out internal metadata keys before passing to google-auth
-        filtered = {k: v for k, v in account_data.items() if not k.startswith("_")}
-        try:
-            return Credentials.from_authorized_user_info(filtered, SCOPES)
-        except Exception as exc:
-            LOGGER.warning("Failed to load full credentials for '%s': %s", account_name, exc)
-            return None
-
-    # Old format: only refresh_token — build using config values
     refresh_token = account_data.get("refresh_token")
-    if refresh_token:
-        from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_TOKEN_URI
+    access_token = account_data.get("access_token") or account_data.get("token")
 
-        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-            LOGGER.warning(
-                "Cannot build credentials for '%s': "
-                "old format requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.",
-                account_name,
-            )
-            return None
+    if not refresh_token and not access_token:
+        LOGGER.warning("No usable credential data for '%s'.", account_name)
+        return None
 
-        return Credentials(
-            token=None,
-            refresh_token=refresh_token,
-            token_uri=GOOGLE_TOKEN_URI,
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            scopes=SCOPES,
+    from config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_TOKEN_URI
+
+    client_id = account_data.get("client_id") or GOOGLE_CLIENT_ID
+    client_secret = account_data.get("client_secret") or GOOGLE_CLIENT_SECRET
+    token_uri = account_data.get("token_uri") or GOOGLE_TOKEN_URI
+
+    if refresh_token and (not client_id or not client_secret):
+        LOGGER.warning(
+            "Cannot build credentials for '%s': missing client_id or client_secret.",
+            account_name,
         )
+        return None
 
-    LOGGER.warning("No usable credential data for '%s'.", account_name)
-    return None
+    expiry_value = account_data.get("expiry")
+    expiry = None
+    if isinstance(expiry_value, str) and expiry_value:
+        try:
+            expiry = datetime.fromisoformat(expiry_value)
+        except ValueError:
+            LOGGER.warning("Invalid expiry value for '%s': %s", account_name, expiry_value)
+
+    return Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri=token_uri,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=account_data.get("scopes") or SCOPES,
+        expiry=expiry,
+    )
 
 
 def _try_refresh(account_name: str, creds: Credentials) -> Credentials | None:
@@ -299,7 +325,8 @@ def _save_credential(
 ) -> None:
     """Store the full credential object and persist (local only)."""
     accounts[account_name] = {
-        "token": creds.token,
+        "email": account_name,
+        "access_token": creds.token,
         "refresh_token": creds.refresh_token,
         "token_uri": creds.token_uri,
         "client_id": creds.client_id,
