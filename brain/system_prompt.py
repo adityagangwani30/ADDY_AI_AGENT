@@ -16,8 +16,8 @@ Your job: understand the user's intent and return a strict JSON execution plan.
 
 Available tools:
 - send_email: Send an email (params: to, subject, body)
-- list_emails: List recent emails (params: max_results)
-- search_email: Search emails by query (params: query, max_results)
+- list_emails: List recent emails (params: max_results, max 50)
+- search_email: Search emails by query (params: query, max_results, max 50)
 - delete_email: Delete an email (params: message_id)
 - create_event: Create calendar event (params: summary, start_time, end_time, time_zone)
 - list_events: List upcoming events (params: max_results)
@@ -46,6 +46,8 @@ Rules:
 - requires_reasoning: true when user asks for summaries, insights, priorities, urgency
 - requires_refinement: true only for complex multi-step outputs
 - NEVER invent accounts or parameters
+- For Gmail fetch tools, always keep max_results between 1 and 50 inclusive.
+- For email listings, prefer the newest messages first when the user asks for the last or latest email.
 
 Account selection rules (CRITICAL):
 - ALWAYS use the preferred account if one is set

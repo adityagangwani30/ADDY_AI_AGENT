@@ -51,6 +51,7 @@ DAILY_LLM_CALL_LIMIT = 100
 TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
 MAX_LLM_CALLS_PER_REQUEST = 4
+MAX_GMAIL_RESULTS = 50
 
 
 def _log(level: int, **payload: Any) -> None:
@@ -550,18 +551,20 @@ class SecureHybridAgent:
         if tool_name in ("list_emails", "search_email"):
             msgs = tool_result.get("messages", [])
             if not msgs:
-                return "No emails found."
+                return "📧 Email Details:\n\nNo emails found."
             lines = []
             for i, m in enumerate(msgs, 1):
+                body = str(m.get("body", "") or "").strip()
+                body_preview = body[:200] + ("..." if len(body) > 200 else "") if body else ""
                 lines.append(
-                    f"Email {i}:\n"
-                    f"  Subject: {m.get('subject', m.get('Subject', 'N/A'))}\n"
-                    f"  From: {m.get('from', m.get('From', 'Unknown'))}\n"
-                    f"  Date: {m.get('date', m.get('internalDate', ''))}\n"
-                    f"  Labels: {', '.join(m.get('labelIds', [])) or 'none'}\n"
-                    f"  Snippet: {m.get('snippet', '')}")
-            return (f"Total: {tool_result.get('count', len(msgs))}"
-                    f" email(s)\n\n" + "\n\n".join(lines))
+                    f"• Email {i}:\n"
+                    f"  Subject: {m.get('subject', m.get('Subject', 'No Subject'))}\n"
+                    f"  From: {m.get('from', m.get('From', 'Unknown Sender'))}\n"
+                    f"  Snippet: {m.get('snippet', '') or 'No snippet available'}"
+                    + (f"\n  Body: {body_preview}" if body_preview else ""))
+            return ("📧 Email Details:\n\n"
+                    f"Total: {tool_result.get('count', len(msgs))} email(s)\n\n"
+                    + "\n\n".join(lines))
 
         if tool_name == "list_events":
             evts = tool_result.get("events", [])
@@ -648,8 +651,11 @@ class SecureHybridAgent:
         model_cls = TOOL_PARAMETER_MODELS.get(tool_name)
         if not model_cls:
             raise ValueError(f"No schema for '{tool_name}'.")
+        normalized = dict(parameters or {})
+        if tool_name in {"list_emails", "search_email"} and "max_results" in normalized:
+            normalized["max_results"] = self._clamp_max_results(normalized["max_results"])
         try:
-            v = model_cls.model_validate(parameters or {})
+            v = model_cls.model_validate(normalized)
         except ValidationError as exc:
             raise ValueError(f"Invalid parameters: {exc}") from exc
         return v.model_dump(exclude_none=True)
@@ -664,6 +670,13 @@ class SecureHybridAgent:
             except (TypeError, ValueError):
                 return 0
         return 0
+
+    @staticmethod
+    def _clamp_max_results(value: Any) -> int:
+        try:
+            return max(1, min(int(value), MAX_GMAIL_RESULTS))
+        except (TypeError, ValueError):
+            return 1
 
     def _is_accounts_question(self, low: str) -> bool:
         return any(p in low for p in (
