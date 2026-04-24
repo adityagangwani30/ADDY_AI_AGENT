@@ -36,6 +36,10 @@ from config import LLM_TIMEOUT_SECONDS
 from domain.schemas import AgentResult
 from memory.storage import SQLiteMemoryRepository
 
+# Primary account used when no account is specified or resolved.
+# Falls back to the first available account from accounts.json.
+DEFAULT_ACCOUNT_ALIAS = "personal"
+
 LOGGER = logging.getLogger(__name__)
 
 _TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agent-tools")
@@ -272,15 +276,24 @@ class SecureHybridAgent:
             return AgentResult(request_id=rid, status="error",
                                message=msg, error_type="PlannerError")
 
+        # Auto-resolve: fall back to default account if none resolved
         if not account:
-            msg = ("I could not map that request to a connected account. "
-                   "Ask 'what accounts do I have?'")
-            self.memory_repo.add_conversation(session_id, "assistant", msg)
-            self._log_agent_finish(
-                rid, started, tool_name, "AccountResolutionError")
-            return AgentResult(request_id=rid, status="error",
-                               message=msg,
-                               error_type="AccountResolutionError")
+            account = self._get_default_account()
+            if account:
+                _log(logging.INFO, event="auto_default_account",
+                     request_id=rid, tool_name=tool_name,
+                     latency_ms=None, error_type=None,
+                     resolved_account=account)
+            else:
+                msg = ("No connected accounts found. "
+                       "Please add an account first.")
+                self.memory_repo.add_conversation(
+                    session_id, "assistant", msg)
+                self._log_agent_finish(
+                    rid, started, tool_name, "NoAccountsAvailable")
+                return AgentResult(request_id=rid, status="error",
+                                   message=msg,
+                                   error_type="NoAccountsAvailable")
 
         try:
             validated = self._validate_tool_call(
@@ -694,6 +707,18 @@ class SecureHybridAgent:
                 if a.lower() == mapped.lower():
                     return a
         return None
+
+    def _get_default_account(self) -> str | None:
+        """Return the best default account, preferring the configured alias."""
+        # Try the configured default alias first
+        mapped = self.memory_repo.get_account_by_alias(DEFAULT_ACCOUNT_ALIAS)
+        if mapped:
+            resolved = self._resolve_account_identifier(mapped)
+            if resolved:
+                return resolved
+        # Fall back to the first available account
+        available = list_available_accounts()
+        return available[0] if available else None
 
     def _log_agent_finish(self, rid: str, started: float,
                           tool_name: str | None,

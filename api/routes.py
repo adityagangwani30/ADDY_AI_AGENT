@@ -6,7 +6,6 @@ import logging
 import time
 import traceback
 import uuid
-from typing import Any
 
 import requests
 from fastapi import APIRouter, Request
@@ -20,38 +19,6 @@ LOGGER = logging.getLogger(__name__)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# ────────────────────────────────────────────
-# Account display labels → internal aliases
-# ────────────────────────────────────────────
-
-_ACCOUNTS = [
-    {"emoji": "🎓", "label": "College",  "email": "1ms23ec007@msrit.edu",           "alias": "college"},
-    {"emoji": "📧", "label": "Personal", "email": "adityabvbvpn0011@gmail.com",     "alias": "personal"},
-    {"emoji": "🧪", "label": "Exam",     "email": "adityagangwaniexam@gmail.com",   "alias": "exam"},
-    {"emoji": "🔒", "label": "Private",  "email": "ashgangcr7@gmail.com",           "alias": "private"},
-]
-
-# Build button-text → alias map at import time
-_ACCOUNT_BUTTON_MAP: dict[str, str] = {}
-for _acct in _ACCOUNTS:
-    _btn = f"{_acct['emoji']} {_acct['label']} ({_acct['email']})"
-    _ACCOUNT_BUTTON_MAP[_btn] = _acct["alias"]
-
-# ────────────────────────────────────────────
-# Menu state tracking (in-memory, per chat)
-# ────────────────────────────────────────────
-
-_MENU_STATE: dict[int, str] = {}  # chat_id → "email" | "calendar" | "drive" | "main"
-
-# ────────────────────────────────────────────
-# Menu button labels (constants)
-# ────────────────────────────────────────────
-
-BTN_EMAIL    = "📩 Email"
-BTN_CALENDAR = "📅 Calendar"
-BTN_DRIVE    = "📁 Drive"
-BTN_ASK      = "🤖 Ask Anything"
-BTN_BACK     = "⬅️ Back"
 
 # ────────────────────────────────────────────
 # Telegram helper functions
@@ -63,30 +30,14 @@ def _log(level: int, **payload: object) -> None:
 
 
 def send_text(chat_id: int, text: str) -> None:
-    """Send a plain text message (no keyboard change)."""
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10,
-        )
-    except Exception:
-        pass
-
-
-def _send_keyboard(chat_id: int, text: str, keyboard: list[list[str]]) -> None:
-    """Send a message with a ReplyKeyboardMarkup."""
+    """Send a plain text message with keyboard removed."""
     try:
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
             json={
                 "chat_id": chat_id,
                 "text": text,
-                "reply_markup": {
-                    "keyboard": keyboard,
-                    "resize_keyboard": True,
-                    "one_time_keyboard": False,
-                },
+                "reply_markup": {"remove_keyboard": True},
             },
             timeout=10,
         )
@@ -94,52 +45,31 @@ def _send_keyboard(chat_id: int, text: str, keyboard: list[list[str]]) -> None:
         pass
 
 
-def send_main_menu(chat_id: int) -> None:
-    """Show the top-level main menu."""
-    _MENU_STATE[chat_id] = "main"
-    _send_keyboard(
-        chat_id,
-        "Hey! 👋 What would you like to do?",
-        [
-            [BTN_EMAIL, BTN_CALENDAR],
-            [BTN_DRIVE, BTN_ASK],
-        ],
+def send_welcome(chat_id: int) -> None:
+    """Send a clean welcome message — no buttons, no menus."""
+    welcome = (
+        "Hey! 👋 I'm your personal AI assistant.\n\n"
+        "Just type what you need — here are some things I can help with:\n\n"
+        "📩 *Email* — \"list my emails\", \"send email to X\", \"any urgent emails?\"\n"
+        "📅 *Calendar* — \"what meetings do I have today?\", \"create a meeting\"\n"
+        "📁 *Drive* — \"list my drive files\"\n"
+        "🤖 *Anything else* — \"summarize this\", ask me a question\n\n"
+        "Just type naturally and I'll handle the rest!"
     )
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": welcome,
+                "parse_mode": "Markdown",
+                "reply_markup": {"remove_keyboard": True},
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass
 
-
-def send_email_menu(chat_id: int) -> None:
-    """Show the email account selection menu."""
-    _MENU_STATE[chat_id] = "email"
-    buttons = [[btn_text] for btn_text in _ACCOUNT_BUTTON_MAP]
-    buttons.append([BTN_BACK])
-    _send_keyboard(chat_id, "📩 Select an email account:", buttons)
-
-
-def send_calendar_menu(chat_id: int) -> None:
-    """Show the calendar account selection menu."""
-    _MENU_STATE[chat_id] = "calendar"
-    buttons = [[btn_text] for btn_text in _ACCOUNT_BUTTON_MAP]
-    buttons.append([BTN_BACK])
-    _send_keyboard(chat_id, "📅 Select a calendar account:", buttons)
-
-
-def send_drive_menu(chat_id: int) -> None:
-    """Show the drive account selection menu."""
-    _MENU_STATE[chat_id] = "drive"
-    buttons = [[btn_text] for btn_text in _ACCOUNT_BUTTON_MAP]
-    buttons.append([BTN_BACK])
-    _send_keyboard(chat_id, "📁 Select a Drive account:", buttons)
-
-
-# ────────────────────────────────────────────
-# Agent action per-menu context
-# ────────────────────────────────────────────
-
-_MENU_ACTION_PHRASES: dict[str, str] = {
-    "email":    "list my emails from {alias}",
-    "calendar": "show my calendar events from {alias}",
-    "drive":    "list my files from {alias}",
-}
 
 # ────────────────────────────────────────────
 # Webhook route
@@ -170,44 +100,10 @@ async def telegram_webhook(request: Request):
 
     # ── /start command ──────────────────────
     if user_text == "/start":
-        send_main_menu(chat_id)
+        send_welcome(chat_id)
         return JSONResponse({"ok": True})
 
-    # ── Back button ─────────────────────────
-    if user_text == BTN_BACK:
-        send_main_menu(chat_id)
-        return JSONResponse({"ok": True})
-
-    # ── Main menu clicks ────────────────────
-    if user_text == BTN_EMAIL:
-        send_email_menu(chat_id)
-        return JSONResponse({"ok": True})
-
-    if user_text == BTN_CALENDAR:
-        send_calendar_menu(chat_id)
-        return JSONResponse({"ok": True})
-
-    if user_text == BTN_DRIVE:
-        send_drive_menu(chat_id)
-        return JSONResponse({"ok": True})
-
-    if user_text == BTN_ASK:
-        send_text(chat_id, "🤖 Go ahead — type your question and I'll answer it!")
-        _MENU_STATE[chat_id] = "main"
-        return JSONResponse({"ok": True})
-
-    # ── Account selection (from sub-menus) ──
-    alias = _ACCOUNT_BUTTON_MAP.get(user_text)
-    menu_context = _MENU_STATE.get(chat_id, "main")
-
-    if alias and menu_context in _MENU_ACTION_PHRASES:
-        # Build a natural-language command for the agent
-        agent_message = _MENU_ACTION_PHRASES[menu_context].format(alias=alias)
-        reply_text = await _run_agent_safe(agent_message, str(chat_id), request_id, started)
-        send_text(chat_id, reply_text)
-        return JSONResponse({"ok": True})
-
-    # ── Fallback: pass free-text to AI agent ─
+    # ── All input goes straight to the AI agent ──
     _log(
         logging.INFO,
         event="agent_execution_start",

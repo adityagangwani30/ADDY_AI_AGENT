@@ -46,7 +46,15 @@ Rules:
 - requires_reasoning: true when user asks for summaries, insights, priorities, urgency
 - requires_refinement: true only for complex multi-step outputs
 - NEVER invent accounts or parameters
-- Use the preferred account when available
+
+Account selection rules (CRITICAL):
+- ALWAYS use the preferred account if one is set
+- If the user mentions a specific account name/alias, use that account
+- If no account is mentioned AND no preferred account is set, leave account as null
+  (the system will auto-select the default account — do NOT ask the user to choose)
+- NEVER ask the user to select or specify an account
+- NEVER generate a direct_response asking the user which account to use
+- The user should NEVER need to manually pick an account
 """
 
 RESPONSE_BUILDER_SYSTEM_PROMPT = """\

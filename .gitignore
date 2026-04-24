@@ -5,6 +5,7 @@
 !.env.example
 accounts.json
 client_secret.json
+credentials.json
 *.key
 *.pem
 

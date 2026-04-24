@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,17 +14,22 @@ LOGGER = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ACCOUNTS_FILE = BASE_DIR / "accounts.json"
+CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 
 class AuthConfigurationError(RuntimeError):
     """Raised when OAuth configuration is incomplete or invalid."""
+
+
+class AuthReauthRequired(RuntimeError):
+    """Raised when an account needs re-authentication (token revoked, expired, etc.)."""
 
 
 # ────────────────────────────────────────────
@@ -77,6 +83,91 @@ def list_available_accounts() -> list[str]:
     return list(load_accounts().keys())
 
 
+def mark_account_invalid(account_name: str) -> None:
+    """
+    Mark an account as needing re-authentication.
+
+    Sets an 'invalid' flag in the stored account data so the system
+    can prompt the user to re-authenticate.
+    """
+    accounts = load_accounts()
+    if account_name in accounts:
+        accounts[account_name]["_invalid"] = True
+        accounts[account_name]["_invalid_since"] = datetime.now(timezone.utc).isoformat()
+        save_accounts(accounts)
+        LOGGER.warning("Account '%s' marked as invalid — re-authentication required.", account_name)
+
+
+def is_account_invalid(account_name: str) -> bool:
+    """Check if an account has been marked as invalid."""
+    accounts = load_accounts()
+    account_data = accounts.get(account_name, {})
+    return account_data.get("_invalid", False)
+
+
+# ────────────────────────────────────────────
+# Automated re-authentication
+# ────────────────────────────────────────────
+
+
+def auto_authenticate(email: str) -> Credentials:
+    """
+    Run the InstalledAppFlow to re-authenticate an account.
+
+    Opens the browser, captures the redirect, and returns fresh Credentials.
+    Also updates accounts.json.
+    """
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from config import GOOGLE_TOKEN_URI
+
+    if not CREDENTIALS_FILE.exists():
+        raise FileNotFoundError(
+            f"credentials.json not found at {CREDENTIALS_FILE}. "
+            "Download it from Google Cloud Console."
+        )
+
+    LOGGER.info("Starting automated OAuth flow for '%s'...", email)
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(CREDENTIALS_FILE),
+        SCOPES,
+    )
+
+    creds = flow.run_local_server(
+        port=8080,
+        prompt="consent",
+        access_type="offline",
+        login_hint=email,
+    )
+
+    if not creds.refresh_token:
+        raise AuthReauthRequired(
+            f"Refresh token missing for '{email}'. "
+            "Revoke app access at https://myaccount.google.com/permissions and retry."
+        )
+
+    # Save to accounts.json
+    accounts = load_accounts()
+    accounts[email] = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": GOOGLE_TOKEN_URI,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": list(creds.scopes) if creds.scopes else SCOPES,
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
+    }
+
+    # Clear invalid flag if present
+    accounts[email].pop("_invalid", None)
+    accounts[email].pop("_invalid_since", None)
+
+    save_accounts(accounts)
+    LOGGER.info("Successfully authenticated '%s' and saved tokens.", email)
+
+    return creds
+
+
 # ────────────────────────────────────────────
 # Credential retrieval (core function)
 # ────────────────────────────────────────────
@@ -90,8 +181,19 @@ def get_credentials(account_name: str) -> Credentials:
       1. Load stored credentials (from ENV or file)
       2. Build Credentials object (supports old and new format)
       3. If expired → auto-refresh via refresh_token
-      4. If refresh fails → raise clear error (no silent failure)
+      4. If refresh fails → mark account invalid and raise clear error
+
+    Auto-recovery: If any token refresh fails, the account is marked as
+    invalid and an AuthReauthRequired error is raised with instructions
+    for the user to reconnect.
     """
+    # Check if account is already flagged as invalid
+    if is_account_invalid(account_name):
+        raise AuthReauthRequired(
+            f"⚠️ Account '{account_name}' needs re-authentication. "
+            "Please reconnect by running: python reauth.py --email " + account_name
+        )
+
     accounts = load_accounts()
     account_data = accounts.get(account_name)
 
@@ -115,9 +217,11 @@ def get_credentials(account_name: str) -> Credentials:
         creds = _try_refresh(account_name, creds)
 
     if creds is None:
-        raise AuthConfigurationError(
-            f"Token refresh failed for '{account_name}'. "
-            "The refresh_token may be revoked. Re-authenticate locally and update ACCOUNTS_JSON."
+        # Auto-recovery: mark account as invalid and raise
+        mark_account_invalid(account_name)
+        raise AuthReauthRequired(
+            f"⚠️ Your account '{account_name}' needs re-authentication. "
+            "Please reconnect by running: python reauth.py --email " + account_name
         )
 
     # Persist updated token (locally only)
@@ -139,8 +243,10 @@ def _build_credentials_from_stored(
 
     # New format: full credential object (has client_id or token)
     if "client_id" in account_data or "token" in account_data:
+        # Filter out internal metadata keys before passing to google-auth
+        filtered = {k: v for k, v in account_data.items() if not k.startswith("_")}
         try:
-            return Credentials.from_authorized_user_info(account_data, SCOPES)
+            return Credentials.from_authorized_user_info(filtered, SCOPES)
         except Exception as exc:
             LOGGER.warning("Failed to load full credentials for '%s': %s", account_name, exc)
             return None
@@ -199,5 +305,6 @@ def _save_credential(
         "client_id": creds.client_id,
         "client_secret": creds.client_secret,
         "scopes": list(creds.scopes) if creds.scopes else SCOPES,
+        "expiry": creds.expiry.isoformat() if creds.expiry else None,
     }
     save_accounts(accounts)

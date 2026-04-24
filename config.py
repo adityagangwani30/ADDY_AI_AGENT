@@ -41,9 +41,10 @@ GOOGLE_TOKEN_URI = _env("GOOGLE_TOKEN_URI", "https://oauth2.googleapis.com/token
 GOOGLE_SCOPES = _env_list(
     "GOOGLE_SCOPES",
     [
-        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
         "https://www.googleapis.com/auth/calendar",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly",
     ],
 )
 
