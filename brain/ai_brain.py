@@ -24,10 +24,16 @@ from pydantic import ValidationError
 
 from auth.google_auth_manager import list_available_accounts
 from brain.llm_provider import FALLBACK_MESSAGE, call_llm
-from brain.system_prompt import GENERAL_ANSWER_SYSTEM_PROMPT, SUMMARIZATION_SYSTEM_PROMPT
+from brain.system_prompt import (
+    GENERAL_ANSWER_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT,
+    REASONING_SYSTEM_PROMPT,
+    REFINEMENT_SYSTEM_PROMPT,
+    RESPONSE_BUILDER_SYSTEM_PROMPT,
+)
 from brain.tool_registry import DESTRUCTIVE_TOOLS, TOOLS, TOOL_PARAMETER_MODELS
 from config import LLM_TIMEOUT_SECONDS
-from domain.schemas import AgentDecision, AgentResult
+from domain.schemas import AgentResult
 from memory.storage import SQLiteMemoryRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -40,7 +46,7 @@ DAILY_LLM_CALL_LIMIT = 100
 
 TOOL_TIMEOUT_SECONDS = 8
 MAX_HISTORY_MESSAGES = 6
-MAX_LLM_CALLS_PER_REQUEST = 2
+MAX_LLM_CALLS_PER_REQUEST = 4
 
 
 def _log(level: int, **payload: Any) -> None:
@@ -159,787 +165,549 @@ def execute_tool(
 
 class SecureHybridAgent:
     """
-    Smart hybrid architecture:
-    1) Heuristic intent routing (no classification call)
-    2) Conditional multi-step LLM pipeline:
-       - Fast path: direct tool execution for simple queries (no LLM)
-       - Smart path: tool execution → LLM summarization for reasoning queries
-    3) Max 2 LLM calls per user message (Groq primary → NVIDIA fallback)
-    4) Deterministic fallback when LLM is unavailable
-    """
+    LLM-first multi-step personal assistant.
 
-    _REASONING_KEYWORDS = (
-        "summarize", "summarise", "summary", "analyze", "analyse", "analysis",
-        "compare", "explain", "insights", "insight", "important", "urgent",
-        "priority", "highlight", "overview", "brief", "digest", "recap",
-        "what's new", "what happened", "anything important", "any urgent",
-        "key takeaways", "action items", "today",
-    )
+    Pipeline:
+    1) LLM Planner   — understand intent, select tools (MANDATORY)
+    2) Tool Execution — deterministic, validated (if needed)
+    3) LLM Response   — natural-language formatting (ALWAYS for tools)
+    4) LLM Reasoning  — summarization / insights (CONDITIONAL)
+    5) LLM Refinement — polish verbose output (RARE)
+
+    LLM budget: min 1, typical 2-3, max 4 calls per request.
+    """
 
     def __init__(self) -> None:
         self.memory_repo = SQLiteMemoryRepository()
         self._daily_limiter = _DAILY_LLM_LIMITER
 
     def run(self, user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
-        """
-        Process a user message and return an ``AgentResult``.
-
-        Routing order:
-        1. Account overview shortcut (no tool / no LLM call).
-        2. Confirmation / cancellation of pending destructive actions.
-        3. Heuristic intent detection → direct tool execution (no LLM call).
-        4. LLM tool planner → validated tool execution.
-
-        Args:
-            user_message: Raw text message from the user.
-            session_id: Telegram ``chat_id`` used to scope memory.
-            request_id: Optional trace ID; auto-generated if omitted.
-
-        Returns:
-            An ``AgentResult`` with ``status``, ``message``, and optional metadata.
-        """
         rid = request_id or str(uuid.uuid4())
         started = time.perf_counter()
         cleaned = user_message.strip()
-
-        _log(
-            logging.INFO,
-            event="agent_start",
-            request_id=rid,
-            tool_name=None,
-            latency_ms=None,
-            error_type=None,
-        )
+        _log(logging.INFO, event="agent_start", request_id=rid,
+             tool_name=None, latency_ms=None, error_type=None)
 
         if not cleaned:
-            return AgentResult(request_id=rid, status="error", message="Message cannot be empty.")
+            return AgentResult(request_id=rid, status="error",
+                               message="Message cannot be empty.")
 
         self.memory_repo.add_conversation(session_id, "user", cleaned)
         lower = cleaned.lower()
 
+        # --- Quick exits (no LLM) ---
         if self._is_accounts_question(lower):
-            message = self._format_accounts_overview()
-            self.memory_repo.add_conversation(session_id, "assistant", message)
-            return AgentResult(request_id=rid, status="ok", message=message)
+            msg = self._format_accounts_overview()
+            self.memory_repo.add_conversation(session_id, "assistant", msg)
+            return AgentResult(request_id=rid, status="ok", message=msg)
 
         if lower in {"confirm", "yes confirm", "confirm action"}:
             return self._handle_confirmation(session_id, rid)
 
         if lower in {"cancel", "deny", "reject"}:
             self.memory_repo.clear_pending_confirmation(session_id)
-            return AgentResult(request_id=rid, status="ok", message="Pending action cancelled.")
+            return AgentResult(request_id=rid, status="ok",
+                               message="Pending action cancelled.")
 
-        history = self.memory_repo.get_conversation(session_id, limit=MAX_HISTORY_MESSAGES)
-        llm_calls_used = 0
+        # --- Resolve account context ---
+        alias = self._detect_account_alias(lower)
+        if alias:
+            resolved = self._resolve_account_identifier(alias)
+            if resolved:
+                self.memory_repo.set_account_preference(session_id, resolved)
 
-        alias_in_message = self._detect_account_alias(lower)
-        if alias_in_message:
-            resolved_alias_account = self._resolve_account_identifier(alias_in_message)
-            if resolved_alias_account:
-                self.memory_repo.set_account_preference(session_id, resolved_alias_account)
+        preferred = self.memory_repo.get_account_preference(session_id)
+        history = self.memory_repo.get_conversation(
+            session_id, limit=MAX_HISTORY_MESSAGES)
+        llm_calls = 0
 
-        intent = self._heuristic_intent(lower)
-        preferred_account = self.memory_repo.get_account_preference(session_id)
+        # ═══ STEP 1: LLM PLANNER (mandatory) ═══
+        if not self._reserve_llm_call(rid, "planner"):
+            return self._daily_limit_result(session_id, rid, started, None)
+        llm_calls += 1
+        plan = self._plan_with_llm(cleaned, history, preferred, rid)
 
-        if intent == "general_knowledge":
-            if not self._reserve_llm_call(rid, "general_answer"):
-                return self._daily_limit_result(session_id, rid, started, None)
-            llm_calls_used += 1
+        task_type = plan.get("task_type", "direct_answer")
+        needs_reasoning = plan.get("requires_reasoning", False)
+        needs_refinement = plan.get("requires_refinement", False)
+        style = plan.get("response_style", "concise")
 
-            answer = self._answer_general(cleaned, history, rid)
-            self.memory_repo.add_conversation(session_id, "assistant", answer)
+        # ═══ DIRECT ANSWER (no tools) ═══
+        if task_type == "direct_answer":
+            direct = plan.get("direct_response", "")
+            if direct and direct.strip():
+                self.memory_repo.add_conversation(
+                    session_id, "assistant", direct)
+                self._log_agent_finish(rid, started, None, None)
+                return AgentResult(
+                    request_id=rid, status="ok", message=direct)
+
+            if (llm_calls < MAX_LLM_CALLS_PER_REQUEST
+                    and self._reserve_llm_call(rid, "general_answer")):
+                llm_calls += 1
+                answer = self._answer_general(cleaned, history, rid)
+                self.memory_repo.add_conversation(
+                    session_id, "assistant", answer)
+                self._log_agent_finish(rid, started, None, None)
+                return AgentResult(
+                    request_id=rid, status="ok", message=answer)
+
+            self.memory_repo.add_conversation(
+                session_id, "assistant", FALLBACK_MODEL_MESSAGE)
             self._log_agent_finish(rid, started, None, None)
-            return AgentResult(request_id=rid, status="ok", message=answer)
+            return AgentResult(
+                request_id=rid, status="ok", message=FALLBACK_MODEL_MESSAGE)
 
-        decision = self._build_direct_tool_decision(lower, preferred_account)
-        if decision is None:
-            if not self._reserve_llm_call(rid, "tool_planning"):
-                return self._daily_limit_result(session_id, rid, started, None)
-            llm_calls_used += 1
-            decision = self._plan_tool_decision(cleaned, history, preferred_account, intent, rid)
-
-        if decision is None:
-            message = "I could not determine the required tool action. Please rephrase with the exact action."
-            self.memory_repo.add_conversation(session_id, "assistant", message)
-            self._log_agent_finish(rid, started, None, "ToolDecisionError")
-            return AgentResult(request_id=rid, status="error", message=message, error_type="ToolDecisionError")
-
-        if decision.type == "response":
-            text = decision.response or "I could not determine the requested tool action."
-            self.memory_repo.add_conversation(session_id, "assistant", text)
-            self._log_agent_finish(rid, started, None, None)
-            return AgentResult(request_id=rid, status="ok", message=text)
-
-        tool_name = decision.tool or ""
-        raw_account = decision.account or preferred_account or ""
+        # ═══ TOOL EXECUTION PATH ═══
+        tool_name = plan.get("tool") or ""
+        raw_account = plan.get("account") or preferred or ""
+        parameters = plan.get("parameters") or {}
         account = self._resolve_account_identifier(raw_account)
 
+        if not tool_name or tool_name not in TOOLS:
+            msg = ("I could not determine the required action. "
+                   "Please rephrase your request.")
+            self.memory_repo.add_conversation(session_id, "assistant", msg)
+            self._log_agent_finish(rid, started, None, "PlannerError")
+            return AgentResult(request_id=rid, status="error",
+                               message=msg, error_type="PlannerError")
+
         if not account:
-            text = "I could not map that request to a connected account. Ask 'what accounts do I have?'"
-            self.memory_repo.add_conversation(session_id, "assistant", text)
-            self._log_agent_finish(rid, started, tool_name, "AccountResolutionError")
-            return AgentResult(request_id=rid, status="error", message=text, error_type="AccountResolutionError")
+            msg = ("I could not map that request to a connected account. "
+                   "Ask 'what accounts do I have?'")
+            self.memory_repo.add_conversation(session_id, "assistant", msg)
+            self._log_agent_finish(
+                rid, started, tool_name, "AccountResolutionError")
+            return AgentResult(request_id=rid, status="error",
+                               message=msg,
+                               error_type="AccountResolutionError")
 
         try:
-            validated = self._validate_tool_call(tool_name, account, decision.parameters)
+            validated = self._validate_tool_call(
+                tool_name, account, parameters)
         except ValueError as exc:
-            self._log_agent_finish(rid, started, tool_name, type(exc).__name__)
-            return AgentResult(request_id=rid, status="error", message=str(exc), error_type=type(exc).__name__)
+            self._log_agent_finish(
+                rid, started, tool_name, type(exc).__name__)
+            return AgentResult(request_id=rid, status="error",
+                               message=str(exc),
+                               error_type=type(exc).__name__)
 
         self.memory_repo.set_account_preference(session_id, account)
 
+        # Destructive action confirmation
         if tool_name in DESTRUCTIVE_TOOLS:
             self.memory_repo.save_pending_confirmation(
-                session_id=session_id,
-                tool_name=tool_name,
-                account=account,
-                parameters=validated,
-            )
-            confirmation_message = (
-                f"Confirmation required for '{tool_name}' on '{account}'. Reply 'confirm' to continue or 'cancel' to abort."
-            )
-            self.memory_repo.add_conversation(session_id, "assistant", confirmation_message)
+                session_id=session_id, tool_name=tool_name,
+                account=account, parameters=validated)
+            cmsg = (f"⚠️ Confirmation required for '{tool_name}' on "
+                    f"'{account}'. Reply 'confirm' or 'cancel'.")
+            self.memory_repo.add_conversation(
+                session_id, "assistant", cmsg)
             self._log_agent_finish(rid, started, tool_name, None)
             return AgentResult(
-                request_id=rid,
-                status="confirmation_required",
-                message=confirmation_message,
-                tool_name=tool_name,
-                account=account,
-            )
+                request_id=rid, status="confirmation_required",
+                message=cmsg, tool_name=tool_name, account=account)
 
-        result = self._execute_and_build_result(
-            session_id=session_id,
-            request_id=rid,
-            tool_name=tool_name,
-            account=account,
-            parameters=validated,
-            user_message=cleaned,
-            llm_calls_used=llm_calls_used,
-        )
-        self._log_agent_finish(rid, started, tool_name, result.error_type)
-        return result
+        # ═══ STEP 2: TOOL EXECUTION (deterministic) ═══
+        result, latency, err = self._execute_tool_safely(
+            tool_name, account, validated, rid)
+        if err:
+            self.memory_repo.add_conversation(session_id, "assistant", err)
+            self._log_agent_finish(rid, started, tool_name, "ToolError")
+            return AgentResult(
+                request_id=rid, status="error", message=err,
+                tool_name=tool_name, account=account,
+                error_type="ToolError")
 
-    def _reserve_llm_call(self, request_id: str, phase: str) -> bool:
-        """
-        Attempt to consume one LLM quota unit for the current UTC day.
+        data_text = self._format_data_for_llm(tool_name, result)
 
-        Returns:
-            ``True`` if the call is allowed, ``False`` if the daily limit is reached.
-        """
-        allowed = self._daily_limiter.try_consume()
-        day_utc, count, limit = self._daily_limiter.snapshot()
-        _log(
-            logging.INFO,
-            event="llm_quota_check",
-            request_id=request_id,
-            tool_name=phase,
-            day_utc=day_utc,
-            daily_count=count,
-            daily_limit=limit,
-            allowed=allowed,
-            latency_ms=0,
-            error_type=None if allowed else "DailyLimitExceeded",
-        )
-        return allowed
+        # ═══ STEP 3: LLM RESPONSE BUILDER (always) ═══
+        response = None
+        if (llm_calls < MAX_LLM_CALLS_PER_REQUEST
+                and self._reserve_llm_call(rid, "response_builder")):
+            llm_calls += 1
+            response = self._build_response_with_llm(
+                cleaned, tool_name, data_text, style, rid)
 
-    def _daily_limit_result(
-        self,
-        session_id: str,
-        request_id: str,
-        started: float,
-        tool_name: str | None,
-    ) -> AgentResult:
-        self.memory_repo.add_conversation(session_id, "assistant", DAILY_LIMIT_MESSAGE)
-        self._log_agent_finish(request_id, started, tool_name, "DailyLimitExceeded")
+        # ═══ STEP 4: LLM REASONING (conditional) ═══
+        if (needs_reasoning
+                and llm_calls < MAX_LLM_CALLS_PER_REQUEST
+                and self._reserve_llm_call(rid, "reasoning")):
+            llm_calls += 1
+            reasoning = self._reason_with_llm(data_text, cleaned, rid)
+            if reasoning:
+                response = reasoning
+
+        # ═══ STEP 5: LLM REFINEMENT (rare) ═══
+        if (needs_refinement and response
+                and llm_calls < MAX_LLM_CALLS_PER_REQUEST
+                and self._reserve_llm_call(rid, "refinement")):
+            llm_calls += 1
+            refined = self._refine_response_with_llm(response, rid)
+            if refined:
+                response = refined
+
+        # Fallback if all LLM calls failed
+        if not response:
+            response = self._fallback_format(tool_name, account, result)
+
+        self.memory_repo.add_conversation(session_id, "assistant", response)
+        self._log_agent_finish(rid, started, tool_name, None)
         return AgentResult(
-            request_id=request_id,
-            status="error",
-            message=DAILY_LIMIT_MESSAGE,
-            tool_name=tool_name,
-            error_type="DailyLimitExceeded",
-        )
+            request_id=rid, status="ok", message=response,
+            tool_name=tool_name, account=account,
+            latency_ms=latency, data=result)
 
-    def _handle_confirmation(self, session_id: str, request_id: str) -> AgentResult:
+    # ── STEP 1 impl ───────────────────────────────────────────────────
+
+    def _plan_with_llm(self, user_message: str,
+                       history: list[dict[str, str]],
+                       preferred_account: str | None,
+                       request_id: str) -> dict:
+        htail = "\n".join(
+            f"{h['role']}: {h['content']}" for h in history[-4:])
+        accounts = sorted(list_available_accounts())
+        aliases = self.memory_repo.list_account_aliases()
+
+        prompt = (
+            f"Preferred account: {preferred_account or 'none'}\n"
+            f"Available accounts: {accounts}\n"
+            f"Alias map: {aliases}\n"
+            f"Recent conversation:\n{htail}\n\n"
+            f"User message: {user_message}")
+
+        text = call_llm(
+            prompt=prompt, system_prompt=PLANNER_SYSTEM_PROMPT,
+            request_id=request_id, phase="planner",
+            timeout_seconds=LLM_TIMEOUT_SECONDS)
+
+        if not text:
+            return {"task_type": "direct_answer",
+                    "direct_response": FALLBACK_MODEL_MESSAGE}
+        try:
+            return self._extract_json(text)
+        except ValueError:
+            return {"task_type": "direct_answer",
+                    "direct_response": text.strip()}
+
+    # ── STEP 3 impl ───────────────────────────────────────────────────
+
+    def _build_response_with_llm(self, user_message: str,
+                                 tool_name: str, data: str,
+                                 style: str,
+                                 request_id: str) -> str | None:
+        prompt = (
+            f"User asked: {user_message}\n"
+            f"Tool executed: {tool_name}\n"
+            f"Response style: {style}\n\n"
+            f"Raw data:\n{data}\n\n"
+            "Convert into a clear, natural response. "
+            "Never show raw JSON or IDs.")
+        return call_llm(
+            prompt=prompt,
+            system_prompt=RESPONSE_BUILDER_SYSTEM_PROMPT,
+            request_id=request_id, phase="response_builder",
+            timeout_seconds=LLM_TIMEOUT_SECONDS)
+
+    # ── STEP 4 impl ───────────────────────────────────────────────────
+
+    def _reason_with_llm(self, data: str, user_message: str,
+                         request_id: str) -> str | None:
+        prompt = (
+            f"User asked: {user_message}\n\n"
+            f"Data to analyze:\n{data}\n\n"
+            "Provide intelligent analysis: identify important items, "
+            "extract action items, highlight urgency, summarize insights.")
+        return call_llm(
+            prompt=prompt, system_prompt=REASONING_SYSTEM_PROMPT,
+            request_id=request_id, phase="reasoning",
+            timeout_seconds=LLM_TIMEOUT_SECONDS)
+
+    # ── STEP 5 impl ───────────────────────────────────────────────────
+
+    def _refine_response_with_llm(self, response: str,
+                                  request_id: str) -> str | None:
+        prompt = ("Polish this response for clarity and brevity. "
+                  f"Return only the improved text:\n\n{response}")
+        return call_llm(
+            prompt=prompt, system_prompt=REFINEMENT_SYSTEM_PROMPT,
+            request_id=request_id, phase="refinement",
+            timeout_seconds=LLM_TIMEOUT_SECONDS)
+
+    # ── General answer ─────────────────────────────────────────────────
+
+    def _answer_general(self, user_message: str,
+                        history: list[dict[str, str]],
+                        request_id: str) -> str:
+        htail = "\n".join(
+            f"{h['role']}: {h['content']}" for h in history[-4:])
+        answer = call_llm(
+            prompt=(f"Recent context:\n{htail}\n\n"
+                    f"User question: {user_message}"),
+            system_prompt=GENERAL_ANSWER_SYSTEM_PROMPT,
+            request_id=request_id, phase="general_answer",
+            timeout_seconds=LLM_TIMEOUT_SECONDS)
+        return answer or FALLBACK_MODEL_MESSAGE
+
+    # ── Tool execution ─────────────────────────────────────────────────
+
+    def _execute_tool_safely(self, tool_name: str, account: str,
+                             parameters: dict[str, Any],
+                             request_id: str
+                             ) -> tuple[Any, int, str | None]:
+        try:
+            r = execute_tool(tool_name=tool_name, account=account,
+                             parameters=parameters, request_id=request_id)
+            return r["result"], r["latency_ms"], None
+        except TimeoutError:
+            return None, 0, ("That request is taking longer than expected."
+                             " Please try again.")
+        except Exception as exc:
+            return None, 0, str(exc)
+
+    # ── Confirmation ───────────────────────────────────────────────────
+
+    def _handle_confirmation(self, session_id: str,
+                             request_id: str) -> AgentResult:
         pending = self.memory_repo.get_pending_confirmation(session_id)
         if not pending:
             return AgentResult(
-                request_id=request_id,
-                status="error",
+                request_id=request_id, status="error",
                 message="No pending action to confirm.",
-                error_type="NoPendingConfirmation",
-            )
+                error_type="NoPendingConfirmation")
 
         self.memory_repo.clear_pending_confirmation(session_id)
-        return self._execute_and_build_result(
-            session_id=session_id,
-            request_id=request_id,
-            tool_name=str(pending["tool_name"]),
-            account=str(pending["account"]),
-            parameters=dict(pending["parameters"]),
-        )
+        tn = str(pending["tool_name"])
+        acc = str(pending["account"])
+        params = dict(pending["parameters"])
 
-    def _execute_and_build_result(
-        self,
-        session_id: str,
-        request_id: str,
-        tool_name: str,
-        account: str,
-        parameters: dict[str, Any],
-        user_message: str = "",
-        llm_calls_used: int = 0,
-    ) -> AgentResult:
-        try:
-            tool_response = execute_tool(
-                tool_name=tool_name,
-                account=account,
-                parameters=parameters,
-                request_id=request_id,
-            )
-        except TimeoutError:
-            message = "That request is taking longer than expected. Please try again."
-            self.memory_repo.add_conversation(session_id, "assistant", message)
+        result, lat, err = self._execute_tool_safely(
+            tn, acc, params, request_id)
+        if err:
+            self.memory_repo.add_conversation(
+                session_id, "assistant", err)
             return AgentResult(
-                request_id=request_id,
-                status="error",
-                message=message,
-                tool_name=tool_name,
-                account=account,
-                error_type="TimeoutError",
-            )
-        except Exception as exc:
-            message = str(exc)
-            self.memory_repo.add_conversation(session_id, "assistant", message)
-            return AgentResult(
-                request_id=request_id,
-                status="error",
-                message=message,
-                tool_name=tool_name,
-                account=account,
-                error_type=type(exc).__name__,
-            )
+                request_id=request_id, status="error", message=err,
+                tool_name=tn, account=acc, error_type="ToolError")
 
-        raw_result = tool_response["result"]
+        resp = None
+        if self._reserve_llm_call(request_id, "confirm_response"):
+            fmt = self._format_data_for_llm(tn, result)
+            resp = self._build_response_with_llm(
+                f"confirmed {tn}", tn, fmt, "concise", request_id)
+        if not resp:
+            resp = self._fallback_format(tn, acc, result)
 
-        # --- Smart path: LLM summarization when reasoning is needed ---
-        if (
-            user_message
-            and self._needs_reasoning(user_message.lower())
-            and llm_calls_used < MAX_LLM_CALLS_PER_REQUEST
-        ):
-            summary = self._summarize_tool_result(
-                user_message=user_message,
-                tool_name=tool_name,
-                tool_result=raw_result,
-                request_id=request_id,
-            )
-            if summary:
-                self.memory_repo.add_conversation(session_id, "assistant", summary)
-                return AgentResult(
-                    request_id=request_id,
-                    status="ok",
-                    message=summary,
-                    tool_name=tool_name,
-                    account=account,
-                    latency_ms=tool_response["latency_ms"],
-                    data=raw_result,
-                )
-
-        # --- Fast path: deterministic formatting ---
-        summary = self._format_tool_result(tool_name, account, raw_result)
-        self.memory_repo.add_conversation(session_id, "assistant", summary)
+        self.memory_repo.add_conversation(session_id, "assistant", resp)
         return AgentResult(
-            request_id=request_id,
-            status="ok",
-            message=summary,
-            tool_name=tool_name,
-            account=account,
-            latency_ms=tool_response["latency_ms"],
-            data=raw_result,
-        )
+            request_id=request_id, status="ok", message=resp,
+            tool_name=tn, account=acc, latency_ms=lat, data=result)
 
-    _GMAIL_KEYWORDS = ("email", "emails", "mail", "mails", "gmail", "inbox", "unread", "message", "messages")
-    _CALENDAR_KEYWORDS = ("calendar", "event", "events", "schedule", "meeting", "agenda", "appointments")
-    _DRIVE_KEYWORDS = ("drive", "file", "files", "folder", "upload", "document", "documents", "storage")
+    # ── Quota ──────────────────────────────────────────────────────────
 
-    def _heuristic_intent(self, lowered_message: str) -> str:
-        """
-        Classify the user's intent using keyword matching (no LLM call).
+    def _reserve_llm_call(self, request_id: str, phase: str) -> bool:
+        allowed = self._daily_limiter.try_consume()
+        day, count, limit = self._daily_limiter.snapshot()
+        _log(logging.INFO, event="llm_quota_check",
+             request_id=request_id, tool_name=phase,
+             day_utc=day, daily_count=count, daily_limit=limit,
+             allowed=allowed, latency_ms=0,
+             error_type=None if allowed else "DailyLimitExceeded")
+        return allowed
 
-        Returns:
-            One of ``"gmail_action"``, ``"calendar_action"``, ``"drive_action"``,
-            or ``"general_knowledge"``.
-        """
-        if any(k in lowered_message for k in self._GMAIL_KEYWORDS):
-            return "gmail_action"
-        if any(k in lowered_message for k in self._CALENDAR_KEYWORDS):
-            return "calendar_action"
-        if any(k in lowered_message for k in self._DRIVE_KEYWORDS):
-            return "drive_action"
-        return "general_knowledge"
+    def _daily_limit_result(self, session_id: str, request_id: str,
+                            started: float,
+                            tool_name: str | None) -> AgentResult:
+        self.memory_repo.add_conversation(
+            session_id, "assistant", DAILY_LIMIT_MESSAGE)
+        self._log_agent_finish(
+            request_id, started, tool_name, "DailyLimitExceeded")
+        return AgentResult(
+            request_id=request_id, status="error",
+            message=DAILY_LIMIT_MESSAGE, tool_name=tool_name,
+            error_type="DailyLimitExceeded")
 
-    def _answer_general(self, user_message: str, history: list[dict[str, str]], request_id: str) -> str:
-        history_tail = "\n".join(f"{h['role']}: {h['content']}" for h in history[-4:])
-        answer = call_llm(
-            prompt=f"Recent context:\n{history_tail}\n\nUser question: {user_message}",
-            system_prompt=GENERAL_ANSWER_SYSTEM_PROMPT,
-            request_id=request_id,
-            phase="general_answer",
-            timeout_seconds=LLM_TIMEOUT_SECONDS,
-        )
-        return answer or FALLBACK_MODEL_MESSAGE
+    # ── Data formatting ────────────────────────────────────────────────
 
-    _SEARCH_EMAIL_PHRASES = ("search email", "find email", "emails from", "emails about", "mail from", "mail about")
-
-    def _build_direct_tool_decision(
-        self, lowered_message: str, preferred_account: str | None
-    ) -> AgentDecision | None:
-        """
-        Attempt to build a tool decision purely from keyword heuristics.
-
-        Skips the LLM planner entirely when a known pattern is found.
-        Requires a ``preferred_account`` to be set (from previous session context).
-
-        Returns:
-            An ``AgentDecision`` with ``type="tool_call"``, or ``None`` if no
-            heuristic matched.
-        """
-        if not preferred_account:
-            return None
-
-        # Search-email detection (must come before generic email detection)
-        if any(phrase in lowered_message for phrase in self._SEARCH_EMAIL_PHRASES):
-            # Extract a rough query from the message by stripping common prefixes
-            query = lowered_message
-            for prefix in ("search email", "find email", "search emails", "find emails"):
-                query = query.replace(prefix, "")
-            query = query.strip() or "is:unread"
-            return AgentDecision(
-                type="tool_call",
-                tool="search_email",
-                account=preferred_account,
-                parameters={"query": query, "max_results": 10},
-            )
-
-        # Flexible email keyword matching
-        if any(k in lowered_message for k in self._GMAIL_KEYWORDS):
-            return AgentDecision(
-                type="tool_call",
-                tool="list_emails",
-                account=preferred_account,
-                parameters={"max_results": 5},
-            )
-
-        # Flexible calendar keyword matching
-        if any(k in lowered_message for k in self._CALENDAR_KEYWORDS):
-            return AgentDecision(
-                type="tool_call",
-                tool="list_events",
-                account=preferred_account,
-                parameters={"max_results": 10},
-            )
-
-        # Flexible drive keyword matching
-        if any(k in lowered_message for k in self._DRIVE_KEYWORDS):
-            return AgentDecision(
-                type="tool_call",
-                tool="list_files",
-                account=preferred_account,
-                parameters={"page_size": 10},
-            )
-
-        return None
-
-    def _plan_tool_decision(
-        self,
-        user_message: str,
-        history: list[dict[str, str]],
-        preferred_account: str | None,
-        intent: str,
-        request_id: str,
-    ) -> AgentDecision | None:
-        history_tail = "\n".join(f"{h['role']}: {h['content']}" for h in history[-4:])
-        available_accounts = sorted(list_available_accounts())
-        aliases = self.memory_repo.list_account_aliases()
-
-        planner_prompt = (
-            "Return strict JSON only.\n"
-            "If tool needed return: {\"type\":\"tool_call\",\"tool\":\"...\",\"account\":\"...\",\"parameters\":{...}}\n"
-            "If tool not needed return: {\"type\":\"response\",\"response\":\"...\"}.\n"
-            "Use only these tools: send_email,list_emails,search_email,delete_email,create_event,list_events,delete_event,list_files,upload_file,delete_file.\n"
-            "Do not return markdown."
-        )
-
-        planner_input = (
-            f"Intent category: {intent}\n"
-            f"Preferred account: {preferred_account or 'none'}\n"
-            f"Available accounts: {available_accounts}\n"
-            f"Alias map: {aliases}\n"
-            f"Recent context:\n{history_tail}\n\n"
-            f"User request: {user_message}"
-        )
-
-        text = call_llm(
-            prompt=planner_input,
-            system_prompt=planner_prompt,
-            request_id=request_id,
-            phase="tool_planning",
-            timeout_seconds=LLM_TIMEOUT_SECONDS,
-        )
-        if not text:
-            return None
-
-        try:
-            return self._parse_decision(text)
-        except ValueError:
-            return None
-
-    def _parse_decision(self, llm_text: str) -> AgentDecision:
-        """
-        Parse a JSON tool-decision string returned by the LLM planner.
-
-        Strips optional markdown fences and extracts the first JSON object
-        found in the response.
-
-        Raises:
-            ValueError: If no valid JSON object can be extracted.
-        """
-        raw = llm_text.strip()
-
-        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
-        if fenced:
-            raw = fenced.group(1)
-
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError("Model output not valid JSON.")
-
-        payload = json.loads(raw[start : end + 1])
-        return AgentDecision.model_validate(payload)
-
-    def _validate_tool_call(
-        self, tool_name: str, account: str, parameters: dict[str, Any]
-    ) -> dict[str, Any]:
-        """
-        Validate that a tool call is safe to execute.
-
-        Checks that the tool is allowlisted, the account is available, and
-        the parameters pass Pydantic schema validation.
-
-        Returns:
-            A clean parameter dict (``None`` values excluded).
-
-        Raises:
-            ValueError: On any validation failure.
-        """
-        if tool_name not in TOOLS:
-            raise ValueError(f"Tool '{tool_name}' is not allowlisted.")
-
-        available_accounts = list_available_accounts()
-        if account not in available_accounts:
-            raise ValueError(f"Account '{account}' is invalid.")
-
-        model_cls = TOOL_PARAMETER_MODELS.get(tool_name)
-        if model_cls is None:
-            raise ValueError(f"No schema configured for '{tool_name}'.")
-
-        try:
-            validated = model_cls.model_validate(parameters or {})
-        except ValidationError as exc:
-            raise ValueError(f"Invalid parameters: {exc}") from exc
-
-        return validated.model_dump(exclude_none=True)
-
-    # ── Smart reasoning detection ──────────────────────────────────────
-
-    def _needs_reasoning(self, lowered_message: str) -> bool:
-        """
-        Determine if the user's query requires LLM reasoning/summarization.
-
-        Uses keyword heuristics only (no LLM call). Returns True when the
-        message contains words implying summarization, analysis, or insight.
-        """
-        return any(kw in lowered_message for kw in self._REASONING_KEYWORDS)
-
-    # ── Data formatting for LLM consumption ────────────────────────────
-
-    def _format_data_for_llm(self, tool_name: str, tool_result: Any) -> str:
-        """
-        Convert raw tool result JSON into structured, human-readable text
-        suitable for passing into an LLM summarization prompt.
-
-        This avoids sending raw JSON blobs to the model, improving output
-        quality significantly.
-        """
+    def _format_data_for_llm(self, tool_name: str,
+                             tool_result: Any) -> str:
         if not isinstance(tool_result, dict):
             return json.dumps(tool_result, default=str, indent=2)
 
         if tool_name in ("list_emails", "search_email"):
-            messages = tool_result.get("messages", [])
-            if not messages:
+            msgs = tool_result.get("messages", [])
+            if not msgs:
                 return "No emails found."
             lines = []
-            for i, msg in enumerate(messages, 1):
-                subject = msg.get("subject", msg.get("Subject", "No subject"))
-                sender = msg.get("from", msg.get("From", msg.get("sender", "Unknown")))
-                snippet = msg.get("snippet", msg.get("Snippet", ""))
-                date = msg.get("date", msg.get("Date", msg.get("internalDate", "")))
-                labels = msg.get("labelIds", [])
+            for i, m in enumerate(msgs, 1):
                 lines.append(
                     f"Email {i}:\n"
-                    f"  - Subject: {subject}\n"
-                    f"  - From: {sender}\n"
-                    f"  - Date: {date}\n"
-                    f"  - Labels: {', '.join(labels) if labels else 'none'}\n"
-                    f"  - Snippet: {snippet}"
-                )
-            return f"Total: {tool_result.get('count', len(messages))} email(s)\n\n" + "\n\n".join(lines)
+                    f"  Subject: {m.get('subject', m.get('Subject', 'N/A'))}\n"
+                    f"  From: {m.get('from', m.get('From', 'Unknown'))}\n"
+                    f"  Date: {m.get('date', m.get('internalDate', ''))}\n"
+                    f"  Labels: {', '.join(m.get('labelIds', [])) or 'none'}\n"
+                    f"  Snippet: {m.get('snippet', '')}")
+            return (f"Total: {tool_result.get('count', len(msgs))}"
+                    f" email(s)\n\n" + "\n\n".join(lines))
 
         if tool_name == "list_events":
-            events = tool_result.get("events", [])
-            if not events:
+            evts = tool_result.get("events", [])
+            if not evts:
                 return "No upcoming events found."
             lines = []
-            for i, evt in enumerate(events, 1):
-                summary = evt.get("summary", "No title")
-                start = evt.get("start", {})
-                start_time = start.get("dateTime", start.get("date", "Unknown"))
-                end = evt.get("end", {})
-                end_time = end.get("dateTime", end.get("date", ""))
-                location = evt.get("location", "")
+            for i, e in enumerate(evts, 1):
+                s = e.get("start", {})
+                ed = e.get("end", {})
+                loc = e.get("location", "")
                 lines.append(
                     f"Event {i}:\n"
-                    f"  - Title: {summary}\n"
-                    f"  - Start: {start_time}\n"
-                    f"  - End: {end_time}\n"
-                    + (f"  - Location: {location}\n" if location else "")
-                )
-            return f"Total: {tool_result.get('count', len(events))} event(s)\n\n" + "\n\n".join(lines)
+                    f"  Title: {e.get('summary', 'No title')}\n"
+                    f"  Start: {s.get('dateTime', s.get('date', '?'))}\n"
+                    f"  End: {ed.get('dateTime', ed.get('date', ''))}\n"
+                    + (f"  Location: {loc}\n" if loc else ""))
+            return (f"Total: {tool_result.get('count', len(evts))}"
+                    f" event(s)\n\n" + "\n\n".join(lines))
 
         if tool_name == "list_files":
             files = tool_result.get("files", [])
             if not files:
                 return "No files found."
-            lines = []
-            for i, f in enumerate(files, 1):
-                lines.append(f"File {i}: {f.get('name', 'Unknown')} (ID: {f.get('id', 'N/A')})")
-            return f"Total: {tool_result.get('count', len(files))} file(s)\n\n" + "\n".join(lines)
+            lines = [f"File {i}: {f.get('name', '?')} "
+                     f"(ID: {f.get('id', 'N/A')})"
+                     for i, f in enumerate(files, 1)]
+            return (f"Total: {tool_result.get('count', len(files))}"
+                    f" file(s)\n\n" + "\n".join(lines))
 
-        # Fallback: compact JSON
-        formatted = json.dumps(tool_result, default=str, indent=2)
-        if len(formatted) > 3000:
-            formatted = formatted[:3000] + "\n... (truncated)"
-        return formatted
-
-    # ── LLM summarization pipeline ─────────────────────────────────────
-
-    def _summarize_tool_result(
-        self,
-        user_message: str,
-        tool_name: str,
-        tool_result: Any,
-        request_id: str,
-    ) -> str | None:
-        """
-        Pass tool results through the LLM for intelligent summarization.
-
-        Only called when _needs_reasoning() returns True and the LLM call
-        budget has not been exhausted.  Returns None on failure so the
-        caller can fall back to deterministic formatting.
-        """
-        if not self._reserve_llm_call(request_id, "summarization"):
-            _log(
-                logging.WARNING,
-                event="summarization_skipped",
-                request_id=request_id,
-                tool_name=tool_name,
-                latency_ms=0,
-                error_type="DailyLimitExceeded",
-            )
-            return None
-
-        formatted_data = self._format_data_for_llm(tool_name, tool_result)
-
-        user_prompt = (
-            f"User asked: {user_message}\n\n"
-            f"Here is the data retrieved:\n{formatted_data}\n\n"
-            "Your task:\n"
-            "- Identify the most important items\n"
-            "- Summarize clearly and concisely\n"
-            "- Highlight key insights, deadlines, or action items\n"
-            "- Use bullet points for readability\n"
-            "- Be informative but not verbose"
-        )
-
-        summary = call_llm(
-            prompt=user_prompt,
-            system_prompt=SUMMARIZATION_SYSTEM_PROMPT,
-            request_id=request_id,
-            phase="summarization",
-            timeout_seconds=LLM_TIMEOUT_SECONDS,
-        )
-        return summary or None
-
-    # ── Deterministic tool-result formatting (fast path) ───────────────
-
-    def _format_tool_result(self, tool_name: str, account: str, tool_result: Any) -> str:
-        if tool_name == "list_emails":
-            count = self._safe_int(tool_result, "count")
-            return f"Fetched {count} email(s) for {account}."
-        if tool_name == "search_email":
-            count = self._safe_int(tool_result, "count")
-            return f"Found {count} email(s) matching your query in {account}."
         if tool_name == "send_email":
-            message_id = self._safe_str(tool_result, "id")
-            return f"Email sent from {account}. Message ID: {message_id}."
-        if tool_name == "delete_email":
-            message_id = self._safe_str(tool_result, "message_id")
-            return f"Deleted email {message_id} from {account}."
-        if tool_name == "list_events":
-            count = self._safe_int(tool_result, "count")
-            return f"Fetched {count} event(s) for {account}."
+            return (f"Email sent. ID: {tool_result.get('id', '?')}, "
+                    f"Thread: {tool_result.get('thread_id', '?')}")
         if tool_name == "create_event":
-            event_id = self._safe_str(tool_result, "id")
-            return f"Created event {event_id} for {account}."
-        if tool_name == "delete_event":
-            event_id = self._safe_str(tool_result, "event_id")
-            return f"Deleted event {event_id} for {account}."
-        if tool_name == "list_files":
-            count = self._safe_int(tool_result, "count")
-            return f"Fetched {count} file(s) for {account}."
+            return (f"Event created. ID: {tool_result.get('id', '?')}, "
+                    f"Link: {tool_result.get('html_link', 'N/A')}")
         if tool_name == "upload_file":
-            file_name = self._safe_str(tool_result, "name")
-            file_id = self._safe_str(tool_result, "id")
-            return f"Uploaded file '{file_name}' to {account}. File ID: {file_id}."
-        if tool_name == "delete_file":
-            file_id = self._safe_str(tool_result, "file_id")
-            return f"Deleted file {file_id} from {account}."
+            return (f"File uploaded. Name: {tool_result.get('name', '?')},"
+                    f" ID: {tool_result.get('id', '?')}")
 
-        preview = json.dumps(tool_result, default=str)
-        if len(preview) > 240:
-            preview = preview[:240] + "..."
-        return f"Action '{tool_name}' completed for {account}. Result: {preview}"
+        out = json.dumps(tool_result, default=str, indent=2)
+        return out[:3000] + "\n...(truncated)" if len(out) > 3000 else out
+
+    # ── Deterministic fallback ─────────────────────────────────────────
+
+    def _fallback_format(self, tool_name: str, account: str,
+                         tool_result: Any) -> str:
+        si = self._safe_int
+        m = {
+            "list_emails": f"📧 Fetched {si(tool_result,'count')} email(s).",
+            "search_email": f"🔍 Found {si(tool_result,'count')} email(s).",
+            "send_email": "✅ Email sent.",
+            "delete_email": "🗑️ Email deleted.",
+            "list_events": f"📅 {si(tool_result,'count')} event(s) found.",
+            "create_event": "✅ Event created.",
+            "delete_event": "🗑️ Event deleted.",
+            "list_files": f"📁 {si(tool_result,'count')} file(s) found.",
+            "upload_file": "✅ File uploaded.",
+            "delete_file": "🗑️ File deleted.",
+        }
+        return m.get(tool_name,
+                     f"Action '{tool_name}' completed for {account}.")
+
+    # ── JSON extraction ────────────────────────────────────────────────
+
+    def _extract_json(self, llm_text: str) -> dict:
+        raw = llm_text.strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```",
+                           raw, flags=re.DOTALL | re.IGNORECASE)
+        if fenced:
+            raw = fenced.group(1)
+        s, e = raw.find("{"), raw.rfind("}")
+        if s == -1 or e == -1 or e <= s:
+            raise ValueError("No JSON found.")
+        return json.loads(raw[s:e + 1])
+
+    # ── Validation ─────────────────────────────────────────────────────
+
+    def _validate_tool_call(self, tool_name: str, account: str,
+                            parameters: dict[str, Any]) -> dict[str, Any]:
+        if tool_name not in TOOLS:
+            raise ValueError(f"Tool '{tool_name}' not allowlisted.")
+        if account not in list_available_accounts():
+            raise ValueError(f"Account '{account}' is invalid.")
+        model_cls = TOOL_PARAMETER_MODELS.get(tool_name)
+        if not model_cls:
+            raise ValueError(f"No schema for '{tool_name}'.")
+        try:
+            v = model_cls.model_validate(parameters or {})
+        except ValidationError as exc:
+            raise ValueError(f"Invalid parameters: {exc}") from exc
+        return v.model_dump(exclude_none=True)
+
+    # ── Utility ────────────────────────────────────────────────────────
 
     @staticmethod
     def _safe_int(payload: Any, key: str) -> int:
         if isinstance(payload, dict):
-            value = payload.get(key, 0)
-            if isinstance(value, int):
-                return value
             try:
-                return int(value)
+                return int(payload.get(key, 0))
             except (TypeError, ValueError):
                 return 0
         return 0
 
-    @staticmethod
-    def _safe_str(payload: Any, key: str) -> str:
-        if isinstance(payload, dict):
-            value = payload.get(key)
-            if value is None:
-                return "unknown"
-            return str(value)
-        return "unknown"
-
-    def _is_accounts_question(self, lowered_message: str) -> bool:
-        return any(
-            phrase in lowered_message
-            for phrase in (
-                "what accounts do i have",
-                "show my accounts",
-                "list my accounts",
-                "which accounts do i have",
-            )
-        )
+    def _is_accounts_question(self, low: str) -> bool:
+        return any(p in low for p in (
+            "what accounts do i have", "show my accounts",
+            "list my accounts", "which accounts do i have"))
 
     def _format_accounts_overview(self) -> str:
         aliases = self.memory_repo.list_account_aliases()
         ordered = ["exam", "college", "personal", "private"]
         lines: list[str] = []
+        for k in ordered:
+            v = aliases.get(k)
+            if v:
+                lines.append(f"{k.title()} - {v}")
+        for k in sorted(aliases.keys()):
+            if k not in ordered:
+                lines.append(f"{k.title()} - {aliases[k]}")
+        return "\n".join(lines) if lines else "No accounts configured."
 
-        for key in ordered:
-            value = aliases.get(key)
-            if value:
-                lines.append(f"{key.title()} - {value}")
-
-        for key in sorted(aliases.keys()):
-            if key not in ordered:
-                lines.append(f"{key.title()} - {aliases[key]}")
-
-        if not lines:
-            return "No accounts configured."
-        return "\n".join(lines)
-
-    def _detect_account_alias(self, lowered_message: str) -> str | None:
-        aliases = self.memory_repo.list_account_aliases()
-        for alias in aliases:
-            if alias in lowered_message:
+    def _detect_account_alias(self, low: str) -> str | None:
+        for alias in self.memory_repo.list_account_aliases():
+            if alias in low:
                 return alias
         return None
 
-    def _resolve_account_identifier(self, raw_identifier: str) -> str | None:
-        """
-        Resolve a raw account string to a verified account key.
-
-        Resolution order:
-        1. Exact match against available accounts.
-        2. Case-insensitive match.
-        3. Alias lookup (DB + defaults), then re-matched against available accounts.
-
-        Returns:
-            The resolved account key, or ``None`` if unresolvable.
-        """
-        identifier = raw_identifier.strip().lower()
-        if not identifier:
+    def _resolve_account_identifier(self, raw: str) -> str | None:
+        ident = raw.strip().lower()
+        if not ident:
             return None
-
         available = list_available_accounts()
-
-        if identifier in available:
-            return identifier
-
-        for account in available:
-            if account.lower() == identifier:
-                return account
-
-        mapped = self.memory_repo.get_account_by_alias(identifier)
+        if ident in available:
+            return ident
+        for a in available:
+            if a.lower() == ident:
+                return a
+        mapped = self.memory_repo.get_account_by_alias(ident)
         if mapped:
             if mapped in available:
                 return mapped
-            for account in available:
-                if account.lower() == mapped.lower():
-                    return account
-
+            for a in available:
+                if a.lower() == mapped.lower():
+                    return a
         return None
 
-    def _log_agent_finish(self, request_id: str, started: float, tool_name: str | None, error_type: str | None) -> None:
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        _log(
-            logging.INFO,
-            event="agent_finish",
-            request_id=request_id,
-            tool_name=tool_name,
-            latency_ms=latency_ms,
-            error_type=error_type,
-        )
+    def _log_agent_finish(self, rid: str, started: float,
+                          tool_name: str | None,
+                          error_type: str | None) -> None:
+        ms = int((time.perf_counter() - started) * 1000)
+        _log(logging.INFO, event="agent_finish", request_id=rid,
+             tool_name=tool_name, latency_ms=ms, error_type=error_type)
 
 
 _AGENT = SecureHybridAgent()
 
 
-def run_agent(user_message: str, session_id: str, request_id: str | None = None) -> AgentResult:
-    """
-    Module-level entry point for running the singleton agent.
-
-    Called by the FastAPI route handler via ``asyncio.to_thread``.
-
-    Args:
-        user_message: The user's Telegram message text.
-        session_id: Telegram ``chat_id`` cast to string.
-        request_id: Optional trace ID propagated from the HTTP request.
-
-    Returns:
-        An ``AgentResult`` containing the reply and metadata.
-    """
+def run_agent(user_message: str, session_id: str,
+              request_id: str | None = None) -> AgentResult:
+    """Module-level entry point. Called by FastAPI via asyncio.to_thread."""
     return _AGENT.run(user_message, session_id, request_id)
+
