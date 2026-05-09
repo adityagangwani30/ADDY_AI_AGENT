@@ -227,6 +227,34 @@ python -m unittest discover -s tests
 
 ---
 
+## Phase 3: Document Intelligence (Overview)
+
+This release adds a lightweight document intelligence pipeline aimed at enabling
+PDF understanding, OCR extraction, semantic file retrieval, and unified search
+without introducing external vector databases or heavy infra.
+
+Key components added:
+
+- `services/document_processor.py`: text extraction, simple metadata inference,
+     paragraph/page chunking for TXT, DOCX, and PDF.
+- `services/ocr_service.py`: optional OCR powered by `pytesseract` and `pdf2image`
+     (best-effort; falls back gracefully when binaries are missing).
+- `memory/file_index.py`: SQLite-backed file index and alias table with a
+     deterministic-first search and lightweight ranking.
+- `services/unified_search.py`: combines file index results with existing
+     `MemoryManager` searches for a single interface to query files and memories.
+- Telegram integration updated in `api/routes.py` to process and index
+     uploaded documents for later retrieval.
+
+Design goals:
+
+- Keep memory footprint small and use SQLite for persistence.
+- Deterministic search first (aliases, filenames, keywords), LLM fallback
+     only when necessary.
+- Chunk-aware retrieval to avoid sending whole documents to LLMs.
+- Lightweight, free-tier friendly.
+
+
 ## License
 
 This project is for personal use. Not affiliated with Google or Telegram.

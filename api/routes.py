@@ -23,6 +23,10 @@ from config import TELEGRAM_BOT_TOKEN
 from config import WEBHOOK_SECRET
 from services.account_manager import resolve_account_for_session
 from memory.storage import SQLiteMemoryRepository
+from services.document_processor import process_file
+from memory.file_index import FileIndex
+from memory.memory_manager import MemoryManager
+from services import ocr_service
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
@@ -113,10 +117,64 @@ async def _upload_telegram_document_to_drive(chat_id: int, session_id: str, docu
     local_path: Path | None = None
     try:
         local_path = await _download_telegram_file(file_id)
+        # Lightweight local processing & indexing before upload
+        try:
+            processed = process_file(str(local_path), meta={"source": "telegram", "upload_date": None})
+            index = FileIndex()
+            idx_file_id = f"telegram:{file_id}"
+            index.add_file(
+                file_id=idx_file_id,
+                filename=processed.get("filename") or local_path.name,
+                extracted_text=(processed.get("extracted_text") or "")[:200000],
+                keywords=processed.get("inferred_topic") or "",
+                source="telegram",
+                category=None,
+                aliases=None,
+            )
+            # attempt simple OCR for images/PDFs if text empty
+            if not processed.get("extracted_text"):
+                try:
+                    # ocr_service may be optional
+                    if local_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}:
+                        ocr_text = ocr_service.ocr_image(str(local_path))
+                    elif local_path.suffix.lower() == ".pdf":
+                        ocr_text = ocr_service.ocr_pdf(str(local_path))
+                    else:
+                        ocr_text = ""
+                    if ocr_text:
+                        index.add_file(
+                            file_id=idx_file_id,
+                            filename=processed.get("filename") or local_path.name,
+                            extracted_text=ocr_text[:200000],
+                            keywords=processed.get("inferred_topic") or "",
+                            source="telegram",
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            LOGGER.exception("telegram:processing failed for %s", file_id)
         drive_upload = TOOLS.get("drive_upload")
         if drive_upload is None:
             return "❌ Drive upload tool is not available."
         result = drive_upload(account, file_path=str(local_path))
+        # If upload succeeded, update index entry with drive id
+        try:
+            drive_id = result.get("id") or result.get("fileId")
+            if drive_id:
+                idx = FileIndex()
+                rec = idx.get_by_file_id(f"telegram:{file_id}")
+                if rec:
+                    idx.add_file(
+                        file_id=str(drive_id),
+                        filename=rec.get("filename"),
+                        extracted_text=rec.get("extracted_text"),
+                        keywords=rec.get("keywords"),
+                        source="drive",
+                        upload_ts=rec.get("upload_ts"),
+                    )
+        except Exception:
+            LOGGER.exception("telegram: failed to update index with drive id for %s", file_id)
+
         return "📂 File uploaded to Drive\n" f"Name: {result.get('name', local_path.name)}"
     except Exception as exc:
         return f"❌ Drive upload failed: {exc}"
