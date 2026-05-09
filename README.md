@@ -51,8 +51,11 @@ PhaseOneAssistant  (agent/assistant.py)
      └─── LLM Fallback ──────────────► Tool Execution
                (Groq primary / NVIDIA fallback)
      │
-     ├─── Memory System  (memory/storage.py)
+     ├─── Memory System  (memory/storage.py + memory/memory_manager.py)
      │    SQLite: conversation history, account preferences, aliases, action audit
+     │    Phase 2 additions: `memory_entries`, `recent_context`, `entity_aliases`, `user_preferences`.
+     │    See `memory/memory_manager.py` for a lightweight deterministic-first API,
+     │    alias resolution, and context-aware retrieval used before LLM prompting.
      │
      └─── Auth Manager  (auth/google_auth_manager.py)
           OAuth 2.0 credentials with auto-refresh

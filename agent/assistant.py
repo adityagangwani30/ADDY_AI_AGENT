@@ -63,7 +63,7 @@ class PhaseOneAssistant:
             return AgentResult(request_id=rid, status="error", message=msg, error_type="UnknownIntent")
 
         if route.intent == "general_chat":
-            answer = self._answer_general(text, rid)
+            answer = self._answer_general(text, session_id, rid)
             self.memory_repo.add_conversation(session_id, "assistant", answer)
             return AgentResult(request_id=rid, status="ok", message=answer)
 
@@ -441,9 +441,36 @@ class PhaseOneAssistant:
 
         return ("✅ Action completed successfully.", "ok")
 
-    def _answer_general(self, text: str, request_id: str) -> str:
+    def _answer_general(self, text: str, session_id: str, request_id: str) -> str:
+        # Memory-aware prompting: fetch relevant short-term context and top memories
+        try:
+            recent = self.memory_repo.get_recent_context(session_id, limit=6) if hasattr(self.memory_repo, 'get_recent_context') else []
+        except Exception:
+            recent = []
+
+        try:
+            # lightweight search: look up memories that may match the query
+            memories = self.memory_repo.search_memory_entries(user_id=session_id, query=text, limit=6) if hasattr(self.memory_repo, 'search_memory_entries') else []
+        except Exception:
+            memories = []
+
+        context_lines = []
+        if memories:
+            for m in memories[:4]:
+                context_lines.append(f"MEMORY {m.get('category','')}/{m.get('key','')}: {m.get('value')}")
+        if recent:
+            context_lines.append("RECENT CONVERSATION:")
+            for r in recent:
+                role = r.get('role')
+                msg = r.get('message')
+                context_lines.append(f"{role}: {msg}")
+
+        prefix = "".join([l + "\n" for l in context_lines])
+        # Keep prompt compact and deterministic-first; send only a short context prefix
+        prompt_text = (prefix + "\nUser: " + text) if prefix else text
+
         response = call_llm(
-            prompt=text,
+            prompt=prompt_text,
             system_prompt=GENERAL_SYSTEM_PROMPT,
             request_id=request_id,
             phase="general_chat",
