@@ -10,7 +10,7 @@ from domain.schemas import IntentRouteResult
 ROUTER_PROMPT = """You are an intent router for a personal AI assistant.
 Classify the user request and return ONLY strict JSON:
 {
-    \"intent\": \"gmail_read|gmail_summarize|gmail_draft|gmail_send|calendar_create|calendar_edit|calendar_delete|calendar_list|drive_upload|drive_search|drive_retrieve|drive_share|document_qa|general_chat|unknown\",
+    \"intent\": \"gmail_read|gmail_summarize|gmail_draft|gmail_send|calendar_create|calendar_edit|calendar_delete|calendar_list|drive_upload|drive_search|drive_retrieve|drive_share|github_list_repositories|github_repository_summary|github_commits|github_issues|github_pull_requests|github_changelog|github_draft_commit_message|github_code_summary|github_traceback_explain|github_project_dashboard|document_qa|general_chat|unknown\",
   \"confidence\": 0.0,
   \"parameters\": {}
 }
@@ -21,6 +21,8 @@ Rules:
 - For gmail_send/gmail_draft extract recipient, subject, message, format (plain/html).
 - For calendar actions extract title/start_time/end_time/time_zone when possible.
 - For drive search extract filename.
+- For GitHub repository requests extract repository, owner, and name when possible.
+- For code and traceback requests extract code, language, or traceback_text when possible.
 - Keep output compact.
 """
 
@@ -99,6 +101,23 @@ class IntentRouter:
             if any(x in low for x in ("list", "upcoming", "today", "tomorrow")):
                 return IntentRouteResult(intent="calendar_list", confidence=0.8, parameters={})
             return IntentRouteResult(intent="calendar_create", confidence=0.72, parameters={"title": message})
+
+        if any(x in low for x in ("github", "repo", "repository", "commit", "issue", "pull request", "pr", "changelog")):
+            if any(x in low for x in ("latest repositories", "my repositories", "list repos", "show repos")):
+                return IntentRouteResult(intent="github_list_repositories", confidence=0.84, parameters={})
+            if any(x in low for x in ("changelog", "release notes", "summary of changes")):
+                return IntentRouteResult(intent="github_changelog", confidence=0.83, parameters={"repository": message})
+            if any(x in low for x in ("issues", "issue", "blockers", "stale")):
+                return IntentRouteResult(intent="github_issues", confidence=0.8, parameters={"repository": message})
+            if any(x in low for x in ("pull request", "pull requests", "pr", "review")):
+                return IntentRouteResult(intent="github_pull_requests", confidence=0.8, parameters={"repository": message})
+            if any(x in low for x in ("commit message", "draft commit", "write commit")):
+                return IntentRouteResult(intent="github_draft_commit_message", confidence=0.8, parameters={"changes": message})
+            if any(x in low for x in ("traceback", "error", "stack trace", "bug")):
+                return IntentRouteResult(intent="github_traceback_explain", confidence=0.78, parameters={"traceback_text": message})
+            if any(x in low for x in ("code", "fastapi", "python", "javascript", "typescript", "architecture", "flow")):
+                return IntentRouteResult(intent="github_code_summary", confidence=0.78, parameters={"code": message})
+            return IntentRouteResult(intent="github_repository_summary", confidence=0.76, parameters={"repository": message})
 
         if any(x in low for x in ("drive", "file", "pdf", "document", "upload")):
             if any(x in low for x in ("upload", "put this", "save this")):

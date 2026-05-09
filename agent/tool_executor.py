@@ -16,6 +16,15 @@ from domain.schemas import (
     DriveSearchActionParams,
     DriveShareActionParams,
     DriveUploadActionParams,
+    GitHubChangelogParams,
+    GitHubCodeSummaryParams,
+    GitHubCommitSummaryParams,
+    GitHubDraftCommitParams,
+    GitHubIssuesParams,
+    GitHubListRepositoriesParams,
+    GitHubPullRequestsParams,
+    GitHubRepoRefParams,
+    GitHubTracebackParams,
     GmailDraftParams,
     GmailReadParams,
     GmailSendParams,
@@ -40,6 +49,16 @@ INTENT_TO_TOOL = {
     "drive_search": "drive_search",
     "drive_retrieve": "drive_retrieve",
     "drive_share": "drive_share",
+    "github_list_repositories": "github_list_repositories",
+    "github_repository_summary": "github_repository_summary",
+    "github_commits": "github_commits",
+    "github_issues": "github_issues",
+    "github_pull_requests": "github_pull_requests",
+    "github_changelog": "github_changelog",
+    "github_draft_commit_message": "github_draft_commit_message",
+    "github_code_summary": "github_code_summary",
+    "github_traceback_explain": "github_traceback_explain",
+    "github_project_dashboard": "github_project_dashboard",
 }
 
 PARAM_MODELS = {
@@ -55,6 +74,16 @@ PARAM_MODELS = {
     "drive_search": DriveSearchActionParams,
     "drive_retrieve": DriveRetrieveActionParams,
     "drive_share": DriveShareActionParams,
+    "github_list_repositories": GitHubListRepositoriesParams,
+    "github_repository_summary": GitHubRepoRefParams,
+    "github_commits": GitHubCommitSummaryParams,
+    "github_issues": GitHubIssuesParams,
+    "github_pull_requests": GitHubPullRequestsParams,
+    "github_changelog": GitHubChangelogParams,
+    "github_draft_commit_message": GitHubDraftCommitParams,
+    "github_code_summary": GitHubCodeSummaryParams,
+    "github_traceback_explain": GitHubTracebackParams,
+    "github_project_dashboard": GitHubRepoRefParams,
 }
 
 
@@ -69,9 +98,15 @@ class ToolExecutor:
         if model is None:
             return dict(parameters or {})
         validated = model.model_validate(parameters or {})
-        return validated.model_dump(exclude_none=True)
+        payload = validated.model_dump(exclude_none=True)
+        if intent.startswith("github_") and not payload.get("repository"):
+            repository = str(payload.get("owner") or "").strip()
+            name = str(payload.get("name") or "").strip()
+            if repository and name:
+                payload["repository"] = f"{repository}/{name}"
+        return payload
 
-    def execute(self, intent: str, account: str, parameters: dict[str, Any], request_id: str) -> dict[str, Any]:
+    def execute(self, intent: str, account: str, parameters: dict[str, Any], request_id: str, session_id: str | None = None) -> dict[str, Any]:
         tool_name = normalize_tool_name(INTENT_TO_TOOL.get(intent, intent))
         if not tool_name:
             return {"ok": False, "error": f"Unsupported intent: {intent}", "result": None, "latency_ms": 0}
@@ -82,6 +117,7 @@ class ToolExecutor:
                 account=account,
                 parameters=parameters,
                 request_id=request_id,
+                session_id=session_id,
             )
             if not read_result.get("ok"):
                 return read_result
@@ -92,9 +128,10 @@ class ToolExecutor:
             account=account,
             parameters=parameters,
             request_id=request_id,
+            session_id=session_id,
         )
 
-    def _dispatch(self, tool_name: str, account: str, parameters: dict[str, Any], request_id: str) -> dict[str, Any]:
+    def _dispatch(self, tool_name: str, account: str, parameters: dict[str, Any], request_id: str, session_id: str | None = None) -> dict[str, Any]:
         normalized_tool_name = normalize_tool_name(tool_name)
         fn = TOOLS.get(normalized_tool_name) or TOOLS.get(tool_name)
         if fn is None:
@@ -103,8 +140,11 @@ class ToolExecutor:
         started = time.perf_counter()
         kwargs = dict(parameters or {})
         try:
-            if "request_id" in fn.__code__.co_varnames:
+            code_vars = fn.__code__.co_varnames
+            if "request_id" in code_vars:
                 kwargs["request_id"] = request_id
+            if session_id is not None and "session_id" in code_vars:
+                kwargs["session_id"] = session_id
         except Exception:
             pass
 

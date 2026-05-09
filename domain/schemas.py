@@ -101,6 +101,16 @@ IntentName = Literal[
     "drive_search",
     "drive_retrieve",
     "drive_share",
+    "github_list_repositories",
+    "github_repository_summary",
+    "github_commits",
+    "github_issues",
+    "github_pull_requests",
+    "github_changelog",
+    "github_draft_commit_message",
+    "github_code_summary",
+    "github_traceback_explain",
+    "github_project_dashboard",
     "general_chat",
     "unknown",
 ]
@@ -181,3 +191,59 @@ class DriveRetrieveActionParams(BaseModel):
 class DriveShareActionParams(BaseModel):
     file_id: str = Field(default="", max_length=256)
     filename: str = Field(default="", max_length=255)
+
+
+class GitHubRepoRefParams(BaseModel):
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+
+
+class GitHubListRepositoriesParams(BaseModel):
+    page_size: int = Field(default=10, ge=1, le=100)
+
+
+class GitHubIssuesParams(BaseModel):
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+    state: str = Field(default="open", max_length=32)
+    per_page: int = Field(default=10, ge=1, le=50)
+
+
+class GitHubPullRequestsParams(BaseModel):
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+    state: str = Field(default="open", max_length=32)
+    per_page: int = Field(default=10, ge=1, le=50)
+
+
+class GitHubCommitSummaryParams(BaseModel):
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+    per_page: int = Field(default=10, ge=1, le=50)
+
+
+class GitHubChangelogParams(BaseModel):
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+    per_page: int = Field(default=10, ge=1, le=50)
+
+
+class GitHubCodeSummaryParams(BaseModel):
+    code: str = Field(min_length=1)
+    language: str = Field(default="", max_length=64)
+
+
+class GitHubDraftCommitParams(BaseModel):
+    changes: str = Field(min_length=1)
+    repository: str = Field(default="", max_length=256)
+    owner: str = Field(default="", max_length=128)
+    name: str = Field(default="", max_length=128)
+
+
+class GitHubTracebackParams(BaseModel):
+    traceback_text: str = Field(min_length=1)

@@ -613,6 +613,43 @@ Potential additions (not included in Phase 5):
 
 ---
 
+## Phase 6 — Developer and GitHub Intelligence
+
+Phase 6 turns the assistant into a lightweight developer-aware operating assistant while preserving the existing autonomous workflow stack.
+
+### What Changed
+
+- GitHub REST API integration for repositories, commits, issues, pull requests, README content, and repository metadata
+- deterministic repository intelligence from metadata, README text, and shallow root structure parsing
+- lightweight code understanding for source snippets and tracebacks
+- project-aware memory for active repositories and repo aliases
+- cross-service GitHub event handlers that can trigger reminders through the existing automation layer
+
+### Implementation Notes
+
+- `integrations/github_service.py` performs authenticated, retry-aware GitHub requests with shallow analysis only
+- `tools/github_tools.py` exposes GitHub workflows through the existing tool registry
+- `memory/storage.py` stores project context and active repository preferences
+- `services/document_processor.py` now detects code files and extracts code summaries deterministically
+- `automation/handlers.py` adds GitHub event hooks that reuse the existing reminder handler
+
+### Safety and Performance
+
+- no repository cloning or vector databases
+- rate-limit aware retry/backoff for GitHub API calls
+- cached, compact summaries instead of full repo downloads
+- token values and sensitive content are not logged
+
+### Example Requests
+
+- Show my latest repositories
+- Summarize this repo
+- What changed recently?
+- Show open issues
+- Draft a commit message for this traceback
+
+---
+
 ## License
 
 This project is for personal use. Not affiliated with Google or Telegram.

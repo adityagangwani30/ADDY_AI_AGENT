@@ -32,6 +32,16 @@ TOOL_CAPABILITIES = {
     "drive_retrieve": {"retrieves": "files", "category": "information", "risky": False},
     "drive_upload": {"uploads": "files", "category": "storage", "risky": False},
     "drive_share": {"shares": "files", "category": "sharing", "risky": True},
+    "github_list_repositories": {"lists": "repositories", "category": "development", "risky": False},
+    "github_repository_summary": {"summarizes": "repository", "category": "development", "risky": False},
+    "github_commits": {"summarizes": "commits", "category": "development", "risky": False},
+    "github_issues": {"summarizes": "issues", "category": "development", "risky": False},
+    "github_pull_requests": {"summarizes": "pull requests", "category": "development", "risky": False},
+    "github_changelog": {"summarizes": "changelog", "category": "development", "risky": False},
+    "github_draft_commit_message": {"drafts": "commit message", "category": "development", "risky": False},
+    "github_code_summary": {"summarizes": "code", "category": "development", "risky": False},
+    "github_traceback_explain": {"explains": "traceback", "category": "development", "risky": False},
+    "github_project_dashboard": {"summarizes": "project dashboard", "category": "development", "risky": False},
 }
 
 # Tool chaining templates: what tools work well in sequence
@@ -140,6 +150,62 @@ class DecisionEngine:
                     "tool": "drive_share",
                     "confidence": 0.85,
                     "reasoning": "User wants to share file",
+                })
+
+        elif self._matches_pattern(user_intent, ["github", "repo", "repository", "commit", "issue", "pull request", "pr", "code", "traceback"]):
+            if self._matches_pattern(user_intent, ["list", "show", "latest", "my repositories", "repos"]):
+                tools.append({
+                    "tool": "github_list_repositories",
+                    "confidence": 0.92,
+                    "reasoning": "User wants repository list",
+                })
+            elif self._matches_pattern(user_intent, ["issue", "blocker", "stale"]):
+                tools.append({
+                    "tool": "github_issues",
+                    "confidence": 0.9,
+                    "reasoning": "User wants issue summary",
+                })
+            elif self._matches_pattern(user_intent, ["pull request", "pr", "review"]):
+                tools.append({
+                    "tool": "github_pull_requests",
+                    "confidence": 0.9,
+                    "reasoning": "User wants pull request summary",
+                })
+            elif self._matches_pattern(user_intent, ["commit", "changes", "what changed", "recent"]):
+                tools.append({
+                    "tool": "github_commits",
+                    "confidence": 0.9,
+                    "reasoning": "User wants recent commit summary",
+                })
+            elif self._matches_pattern(user_intent, ["changelog", "release notes"]):
+                tools.append({
+                    "tool": "github_changelog",
+                    "confidence": 0.9,
+                    "reasoning": "User wants changelog generation",
+                })
+            elif self._matches_pattern(user_intent, ["traceback", "error", "stack trace"]):
+                tools.append({
+                    "tool": "github_traceback_explain",
+                    "confidence": 0.88,
+                    "reasoning": "User wants traceback explanation",
+                })
+            elif self._matches_pattern(user_intent, ["commit message", "draft commit"]):
+                tools.append({
+                    "tool": "github_draft_commit_message",
+                    "confidence": 0.88,
+                    "reasoning": "User wants a commit message draft",
+                })
+            elif self._matches_pattern(user_intent, ["code", "fastapi", "python", "javascript", "typescript", "architecture"]):
+                tools.append({
+                    "tool": "github_code_summary",
+                    "confidence": 0.82,
+                    "reasoning": "User wants code summary",
+                })
+            else:
+                tools.append({
+                    "tool": "github_repository_summary",
+                    "confidence": 0.84,
+                    "reasoning": "User wants repository summary",
                 })
 
         # If no deterministic match, use lightweight LLM reasoning
@@ -437,6 +503,14 @@ class DecisionEngine:
             ("drive_retrieve", "Get file details"),
             ("drive_upload", "Upload a file"),
             ("drive_share", "Share a file"),
+            ("github_repository_summary", "Summarize a repository"),
+            ("github_commits", "Summarize recent commits"),
+            ("github_issues", "Summarize repository issues"),
+            ("github_pull_requests", "Summarize pull requests"),
+            ("github_changelog", "Generate a changelog"),
+            ("github_draft_commit_message", "Draft a commit message"),
+            ("github_code_summary", "Summarize code"),
+            ("github_traceback_explain", "Explain a traceback"),
         ]])
 
         prompt = f"""Given this user intent, which tools should be used?
@@ -454,6 +528,8 @@ Only include tools that are clearly needed. Keep it concise."""
                 prompt=prompt,
                 system_prompt="You are a tool selection agent. Return valid JSON only.",
             )
+            if not response:
+                return []
 
             import json
             result = json.loads(response)

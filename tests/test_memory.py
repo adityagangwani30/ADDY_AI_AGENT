@@ -57,6 +57,18 @@ class MemoryManagerTests(unittest.TestCase):
         self.assertTrue(any(r.get("key") == "resume" or "resume" in str(r.get("value", "")).lower() for r in results))
         td.cleanup()
 
+    def test_project_alias_and_active_repository(self):
+        mgr, td = _make_mgr()
+        uid = "u_project"
+        mgr.set_project_alias(uid, "assistant-backend", "octo/demo", metadata={"source": "test"})
+        resolved = mgr.resolve_project_alias(uid, "assistant-backend")
+        self.assertEqual(resolved, "octo/demo")
+        mgr.set_active_repository(uid, "octo/demo")
+        self.assertEqual(mgr.get_active_repository(uid), "octo/demo")
+        context = mgr.list_project_context(uid)
+        self.assertTrue(any(item["repository"] == "octo/demo" for item in context))
+        td.cleanup()
+
 
 if __name__ == '__main__':
     unittest.main()

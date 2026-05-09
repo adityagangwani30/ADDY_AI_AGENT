@@ -13,6 +13,15 @@ from domain.schemas import (
     DriveSearchActionParams,
     DriveShareActionParams,
     DriveUploadActionParams,
+    GitHubChangelogParams,
+    GitHubCodeSummaryParams,
+    GitHubCommitSummaryParams,
+    GitHubDraftCommitParams,
+    GitHubIssuesParams,
+    GitHubListRepositoriesParams,
+    GitHubPullRequestsParams,
+    GitHubRepoRefParams,
+    GitHubTracebackParams,
     GmailDraftParams,
     GmailReadParams,
     GmailSendParams,
@@ -54,6 +63,18 @@ from tools.gmail_tools import (
     list_emails,
     search_email,
     send_email,
+)
+from tools.github_tools import (
+    github_changelog,
+    github_code_summary,
+    github_commits,
+    github_draft_commit_message,
+    github_issues,
+    github_list_repositories,
+    github_project_dashboard,
+    github_pull_requests,
+    github_repository_summary,
+    github_traceback_explain,
 )
 
 CANONICAL_TOOL_ALIASES = {
@@ -99,6 +120,16 @@ TOOLS = {
     "retrieve_file": retrieve_file,
     "share_file": share_file,
     "delete_file": delete_file,
+    "github_list_repositories": github_list_repositories,
+    "github_repository_summary": github_repository_summary,
+    "github_commits": github_commits,
+    "github_issues": github_issues,
+    "github_pull_requests": github_pull_requests,
+    "github_changelog": github_changelog,
+    "github_draft_commit_message": github_draft_commit_message,
+    "github_code_summary": github_code_summary,
+    "github_traceback_explain": github_traceback_explain,
+    "github_project_dashboard": github_project_dashboard,
 }
 
 DESTRUCTIVE_TOOLS = {
@@ -137,4 +168,14 @@ TOOL_PARAMETER_MODELS = {
     "retrieve_file": DriveRetrieveActionParams,
     "share_file": DriveShareActionParams,
     "delete_file": DeleteFileParams,
+    "github_list_repositories": GitHubListRepositoriesParams,
+    "github_repository_summary": GitHubRepoRefParams,
+    "github_commits": GitHubCommitSummaryParams,
+    "github_issues": GitHubIssuesParams,
+    "github_pull_requests": GitHubPullRequestsParams,
+    "github_changelog": GitHubChangelogParams,
+    "github_draft_commit_message": GitHubDraftCommitParams,
+    "github_code_summary": GitHubCodeSummaryParams,
+    "github_traceback_explain": GitHubTracebackParams,
+    "github_project_dashboard": GitHubRepoRefParams,
 }

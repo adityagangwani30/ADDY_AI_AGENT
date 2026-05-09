@@ -75,6 +75,24 @@ class MemoryManager:
     def list_aliases(self, user_id: str | None = None) -> List[dict]:
         return self.repo.list_entity_aliases(user_id)
 
+    def set_project_alias(self, user_id: str | None, alias: str, repository: str, metadata: dict[str, Any] | None = None) -> int:
+        logger.info("project_alias:set user=%s alias=%s", user_id, alias)
+        return self.repo.set_project_alias(user_id, alias, repository, metadata)
+
+    def resolve_project_alias(self, user_id: str | None, alias: str) -> str | None:
+        result = self.repo.resolve_project_alias(user_id, alias)
+        logger.info("project_alias:resolve user=%s alias=%s resolved=%s", user_id, alias, bool(result))
+        return result
+
+    def list_project_context(self, user_id: str) -> List[dict]:
+        return self.repo.list_project_context(user_id)
+
+    def set_active_repository(self, user_id: str, repository: str, alias: str | None = None, metadata: dict[str, Any] | None = None) -> int:
+        return self.repo.set_active_repository(user_id, repository, alias=alias, metadata=metadata)
+
+    def get_active_repository(self, user_id: str) -> str | None:
+        return self.repo.get_active_repository(user_id)
+
     # Preferences
     def set_preference(self, user_id: str, key: str, value: Any) -> None:
         logger.info("preference:set user=%s key=%s", user_id, key)

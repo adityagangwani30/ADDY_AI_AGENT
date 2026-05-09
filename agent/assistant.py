@@ -125,8 +125,13 @@ class PhaseOneAssistant:
                 account=account,
             )
 
-        result = self.executor.execute(route.intent, account, parameters, rid)
+        result = self.executor.execute(route.intent, account, parameters, rid, session_id=session_id)
         message, status = self._format_tool_result(route.intent, result)
+        if route.intent in {"github_repository_summary", "github_project_dashboard", "github_changelog", "github_commits", "github_issues", "github_pull_requests"} and result.get("ok"):
+            repository = str(parameters.get("repository") or f"{parameters.get('owner', '')}/{parameters.get('name', '')}").strip()
+            if repository and "/" in repository:
+                self.memory_repo.set_project_alias(session_id, repository.replace("/", "_"), repository, metadata={"source": route.intent})
+                self.memory_repo.set_active_repository(session_id, repository)
         self.memory_repo.add_conversation(session_id, "assistant", message)
         return AgentResult(
             request_id=rid,
@@ -189,6 +194,13 @@ class PhaseOneAssistant:
                 if payload.get("filename") or payload.get("file_id") or payload.get("file_path"):
                     return payload
 
+        if intent.startswith("github_"):
+            extracted = self._extract_github_parameters(user_text)
+            if extracted:
+                payload.update({key: value for key, value in extracted.items() if value})
+                if payload.get("repository") or payload.get("owner") or payload.get("name") or payload.get("code") or payload.get("traceback_text") or payload.get("changes"):
+                    return payload
+
         if intent in {"gmail_send", "gmail_draft"}:
             if payload.get("recipient") and payload.get("message"):
                 return payload
@@ -244,6 +256,25 @@ class PhaseOneAssistant:
                 system_prompt="Return strict JSON only.",
                 request_id=request_id,
                 phase="param_extract_drive",
+                timeout_seconds=10,
+            )
+            parsed = self._extract_json(text)
+            if parsed:
+                payload.update(parsed)
+            return payload
+
+        if intent.startswith("github_"):
+            prompt = (
+                "Extract JSON for GitHub action. Return only JSON.\n"
+                "Possible keys: repository, owner, name, page_size, per_page, state, changes, code, language, traceback_text.\n\n"
+                f"User: {user_text}\n"
+                f"Existing: {json.dumps(payload, default=str)}"
+            )
+            text = call_llm(
+                prompt=prompt,
+                system_prompt="Return strict JSON only.",
+                request_id=request_id,
+                phase="param_extract_github",
                 timeout_seconds=10,
             )
             parsed = self._extract_json(text)
@@ -310,6 +341,35 @@ class PhaseOneAssistant:
         if file_id_match:
             payload["file_id"] = file_id_match.group(1).strip()
 
+        return payload
+
+    def _extract_github_parameters(self, text: str) -> dict[str, str]:
+        payload: dict[str, str] = {}
+        repo_match = re.search(r"(?:repo|repository)\s*[:=]\s*([^\n;]+)", text, flags=re.IGNORECASE)
+        slug_match = re.search(r"github\.com/([^/\s]+)/([^/#?\s]+)", text, flags=re.IGNORECASE)
+        owner_repo_match = re.search(r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\b", text)
+        code_match = re.search(r"```(?:\w+)?\s*(.*?)```", text, flags=re.DOTALL)
+        traceback_match = re.search(r"Traceback \(most recent call last\):.*", text, flags=re.DOTALL | re.IGNORECASE)
+        language_match = re.search(r"\b(python|javascript|typescript|fastapi|react|go|java|rust)\b", text, flags=re.IGNORECASE)
+        changes_match = re.search(r"(?:changes|summary|diff)\s*[:=]\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
+
+        if repo_match:
+            payload["repository"] = repo_match.group(1).strip()
+        elif slug_match:
+            payload["repository"] = f"{slug_match.group(1).strip()}/{slug_match.group(2).strip().removesuffix('.git')}"
+        elif owner_repo_match and "." not in owner_repo_match.group(1).lower():
+            payload["repository"] = f"{owner_repo_match.group(1).strip()}/{owner_repo_match.group(2).strip().removesuffix('.git')}"
+
+        if code_match:
+            payload["code"] = code_match.group(1).strip()
+        if traceback_match:
+            payload["traceback_text"] = traceback_match.group(0).strip()
+        if language_match:
+            payload["language"] = language_match.group(1).strip().lower()
+        if changes_match:
+            payload["changes"] = changes_match.group(1).strip()
+        elif code_match:
+            payload["changes"] = code_match.group(1).strip()
         return payload
 
     def _extract_json(self, raw: str | None) -> dict[str, Any] | None:

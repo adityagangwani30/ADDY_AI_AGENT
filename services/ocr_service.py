@@ -6,7 +6,10 @@ import re
 import tempfile
 from typing import List
 
-from PIL import Image
+try:
+    from PIL import Image  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
 
 LOGGER = logging.getLogger("services.ocr")
 
@@ -26,8 +29,8 @@ def ocr_image(path: str) -> str:
 
     Falls back gracefully if pytesseract is not available.
     """
-    if pytesseract is None:
-        LOGGER.warning("pytesseract not installed, skipping OCR for %s", path)
+    if pytesseract is None or Image is None:
+        LOGGER.warning("pytesseract or Pillow not installed, skipping OCR for %s", path)
         return ""
 
     try:

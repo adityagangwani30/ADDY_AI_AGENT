@@ -17,6 +17,10 @@ class SafetyAndRoutingTests(unittest.TestCase):
         route = IntentRouter().route("list my emails", "request-1")
         self.assertEqual(route.intent, "gmail_read")
 
+    def test_intent_router_quick_routes_github_summary(self) -> None:
+        route = IntentRouter().route("summarize this repo", "request-1")
+        self.assertIn(route.intent, {"github_repository_summary", "github_code_summary"})
+
     def test_webhook_signature_verification(self) -> None:
         with patch.object(webhook_security, "WEBHOOK_SECRET", "secret-token"):
             self.assertTrue(webhook_security.verify_webhook_signature(b"{}", "secret-token"))

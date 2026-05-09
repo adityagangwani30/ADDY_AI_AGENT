@@ -33,5 +33,32 @@ def send_reminder(payload: Dict[str, Any]) -> bool:
     return True
 
 
+def github_issue_reminder(payload: Dict[str, Any]) -> bool:
+    message = payload.get("message") or payload.get("summary") or "GitHub issue update"
+    payload = dict(payload)
+    payload["message"] = message
+    logger.info("GitHub issue event received for %s", payload.get("repository"))
+    return send_reminder(payload)
+
+
+def github_pr_merged(payload: Dict[str, Any]) -> bool:
+    message = payload.get("message") or payload.get("summary") or "GitHub pull request merged"
+    payload = dict(payload)
+    payload["message"] = message
+    logger.info("GitHub PR event received for %s", payload.get("repository"))
+    return send_reminder(payload)
+
+
+def github_repo_update(payload: Dict[str, Any]) -> bool:
+    message = payload.get("message") or payload.get("summary") or "GitHub repository updated"
+    payload = dict(payload)
+    payload["message"] = message
+    logger.info("GitHub repo update for %s", payload.get("repository"))
+    return send_reminder(payload)
+
+
 # register built-in handlers
 register_handler("send_reminder", send_reminder)
+register_handler("github_issue_reminder", github_issue_reminder)
+register_handler("github_pr_merged", github_pr_merged)
+register_handler("github_repo_update", github_repo_update)

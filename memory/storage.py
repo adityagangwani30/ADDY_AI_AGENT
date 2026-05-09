@@ -206,6 +206,28 @@ class SQLiteMemoryRepository(MemoryRepository):
                     )
                 """)
 
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS project_context (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        alias TEXT,
+                        repository TEXT NOT NULL,
+                        metadata_json TEXT,
+                        active INTEGER DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(user_id, repository)
+                    )
+                """)
+
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_project_context_user_alias ON project_context (user_id, alias)
+                """)
+
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_project_context_user_active ON project_context (user_id, active)
+                """)
+
                 conn.commit()
 
     # ---------------- Pending Confirmation ----------------
@@ -678,7 +700,85 @@ class SQLiteMemoryRepository(MemoryRepository):
             return json.loads(row["preference_value"])
         except Exception:
             return row["preference_value"]
+    # ---------------- Project Context ----------------
 
+    def set_project_context(self, user_id: str, repository: str, alias: str | None = None, metadata: dict[str, Any] | None = None, active: bool = False) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(metadata or {}, default=str)
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO project_context (user_id, alias, repository, metadata_json, active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, repository) DO UPDATE SET
+                        alias=excluded.alias,
+                        metadata_json=excluded.metadata_json,
+                        active=excluded.active,
+                        updated_at=excluded.updated_at
+                    """,
+                    (user_id, alias, repository, payload, 1 if active else 0, now, now),
+                )
+                conn.commit()
+                row = conn.execute("SELECT id FROM project_context WHERE user_id = ? AND repository = ?", (user_id, repository)).fetchone()
+                return int(row["id"]) if row else 0
+
+    def set_active_repository(self, user_id: str, repository: str, alias: str | None = None, metadata: dict[str, Any] | None = None) -> int:
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute("UPDATE project_context SET active = 0 WHERE user_id = ?", (user_id,))
+                conn.commit()
+        return self.set_project_context(user_id, repository, alias=alias, metadata=metadata, active=True)
+
+    def get_active_repository(self, user_id: str) -> str | None:
+        with self._lock:
+            with self._connection() as conn:
+                row = conn.execute("SELECT repository FROM project_context WHERE user_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT 1", (user_id,)).fetchone()
+        return row["repository"] if row else None
+
+    def list_project_context(self, user_id: str) -> list[dict]:
+        with self._lock:
+            with self._connection() as conn:
+                rows = conn.execute("SELECT * FROM project_context WHERE user_id = ? ORDER BY active DESC, updated_at DESC", (user_id,)).fetchall()
+
+        result = []
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                metadata = row["metadata_json"]
+            result.append(
+                {
+                    "id": row["id"],
+                    "user_id": row["user_id"],
+                    "alias": row["alias"],
+                    "repository": row["repository"],
+                    "metadata": metadata,
+                    "active": bool(row["active"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return result
+
+    def set_project_alias(self, user_id: str | None, alias: str, repository: str, metadata: dict[str, Any] | None = None) -> int:
+        alias_key = alias.lower().strip()
+        repo_id = self.set_entity_alias(user_id, alias_key, repository, entity_type="github_repo")
+        if user_id and metadata:
+            self.set_project_context(user_id, repository, alias=alias_key, metadata=metadata, active=False)
+        return repo_id
+
+    def resolve_project_alias(self, user_id: str | None, alias: str) -> str | None:
+        return self.resolve_entity_alias(user_id, alias)
+
+    def list_project_aliases(self, user_id: str | None = None) -> list[dict]:
+        with self._lock:
+            with self._connection() as conn:
+                if user_id is None:
+                    rows = conn.execute("SELECT alias, actual_value, entity_type FROM entity_aliases WHERE entity_type = 'github_repo'").fetchall()
+                else:
+                    rows = conn.execute("SELECT alias, actual_value, entity_type FROM entity_aliases WHERE user_id IS ? AND entity_type = 'github_repo'", (user_id,)).fetchall()
+        return [{"alias": r["alias"], "actual_value": r["actual_value"], "entity_type": r["entity_type"]} for r in rows]
     # ---------------- Cleanup / TTL helpers ----------------
 
     def cleanup_short_term_context(self, user_id: str | None = None, keep_seconds: int = 3600) -> int:
