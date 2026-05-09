@@ -26,6 +26,10 @@ The assistant supports **multiple Google accounts** via OAuth 2.0, stores conver
 | 📱 **Telegram UI** | Intuitive button-menu interface — no commands to memorize |
 | 🔐 **Multi-Account OAuth** | Connect and switch between multiple Google accounts |
 | ⚡ **Hybrid Agent** | Fast heuristic routing + Gemini fallback, with daily call limits |
+| 🧭 **Intent Router** | Structured JSON intent classification for Gmail, Calendar, Drive, and chat |
+| 🛠️ **Tool Executor** | Centralized validated tool dispatch with retries and safe failures |
+| ✅ **Reusable Confirmations** | Confirmation workflow with timeout for risky actions |
+| 📂 **Telegram File Upload** | Upload Telegram documents directly to Google Drive |
 
 ---
 
@@ -59,6 +63,42 @@ SecureHybridAgent  (brain/ai_brain.py)
 - **Tool confirmation gate** — destructive operations (`delete_email`, `delete_file`, `delete_event`) require an explicit `confirm` reply before execution.
 - **Daily Gemini call limit** prevents runaway API spend.
 - **ENV-first credential loading** — on cloud deployments, `ACCOUNTS_JSON` env var replaces the local `accounts.json` file entirely.
+
+---
+
+## Phase 1 Upgrade Notes
+
+Phase 1 introduces modular action execution while preserving existing bot behavior:
+
+- Intent classification with structured JSON output and malformed-response fallback
+- Centralized tool execution with per-intent validation
+- Gmail draft-and-confirm send flow (never auto-sends)
+- Calendar create/edit/delete/list flow with duplicate prevention support
+- Drive search/retrieve/share/upload actions
+- Confirmation timeout handling for risky actions
+- Improved Telegram UX with typing indicator and clearer success/error messages
+
+New internal module:
+
+```
+agent/
+├── assistant.py
+├── confirmation.py
+├── intent_router.py
+└── tool_executor.py
+```
+
+Backward compatibility is preserved through `brain/ai_brain.py`, which now proxies to the new assistant implementation.
+
+---
+
+## Migration Step (Important)
+
+Drive actions in Phase 1 require write access. The default Drive scope is now:
+
+- `https://www.googleapis.com/auth/drive`
+
+If your existing tokens were generated with read-only Drive scope, run re-authentication once so Google issues updated tokens.
 
 ---
 

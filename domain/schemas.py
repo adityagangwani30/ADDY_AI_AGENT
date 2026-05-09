@@ -86,3 +86,98 @@ class UploadFileParams(BaseModel):
 
 class DeleteFileParams(BaseModel):
     file_id: str = Field(min_length=1)
+
+
+IntentName = Literal[
+    "gmail_read",
+    "gmail_summarize",
+    "gmail_draft",
+    "gmail_send",
+    "calendar_create",
+    "calendar_edit",
+    "calendar_delete",
+    "calendar_list",
+    "drive_upload",
+    "drive_search",
+    "drive_retrieve",
+    "drive_share",
+    "general_chat",
+    "unknown",
+]
+
+
+class IntentRouteResult(BaseModel):
+    intent: IntentName
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class GmailReadParams(BaseModel):
+    max_results: int = Field(default=5, ge=1, le=50)
+    query: str = Field(default="in:inbox", min_length=1)
+
+
+class GmailSummarizeParams(BaseModel):
+    max_results: int = Field(default=8, ge=1, le=20)
+    query: str = Field(default="in:inbox", min_length=1)
+
+
+class GmailDraftParams(BaseModel):
+    recipient: str = Field(default="", max_length=320)
+    subject: str = Field(default="", max_length=200)
+    message: str = Field(min_length=1)
+    format: Literal["plain", "html"] = "plain"
+
+
+class GmailSendParams(BaseModel):
+    recipient: str = Field(min_length=3, max_length=320)
+    subject: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1)
+    format: Literal["plain", "html"] = "plain"
+
+
+class CalendarCreateActionParams(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    start_time: str = Field(min_length=1)
+    end_time: str = Field(min_length=1)
+    time_zone: str = Field(default="UTC", min_length=1)
+    participants: list[str] = Field(default_factory=list)
+
+
+class CalendarEditActionParams(BaseModel):
+    event_id: str = Field(default="", max_length=256)
+    title: str = Field(default="", max_length=200)
+    start_time: str = Field(default="", max_length=64)
+    end_time: str = Field(default="", max_length=64)
+    time_zone: str = Field(default="UTC", min_length=1)
+
+
+class CalendarDeleteActionParams(BaseModel):
+    event_id: str = Field(default="", max_length=256)
+    title: str = Field(default="", max_length=200)
+    date_hint: str = Field(default="", max_length=64)
+
+
+class CalendarListActionParams(BaseModel):
+    max_results: int = Field(default=10, ge=1, le=50)
+
+
+class DriveUploadActionParams(BaseModel):
+    file_path: str = Field(min_length=1)
+    mime_type: str | None = None
+    overwrite: bool = False
+
+
+class DriveSearchActionParams(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    max_results: int = Field(default=10, ge=1, le=50)
+
+
+class DriveRetrieveActionParams(BaseModel):
+    file_id: str = Field(default="", max_length=256)
+    filename: str = Field(default="", max_length=255)
+
+
+class DriveShareActionParams(BaseModel):
+    file_id: str = Field(default="", max_length=256)
+    filename: str = Field(default="", max_length=255)

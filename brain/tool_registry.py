@@ -1,10 +1,22 @@
 ﻿from __future__ import annotations
 
 from domain.schemas import (
+    CalendarCreateActionParams,
+    CalendarDeleteActionParams,
+    CalendarEditActionParams,
+    CalendarListActionParams,
     CreateEventParams,
     DeleteEmailParams,
     DeleteEventParams,
     DeleteFileParams,
+    DriveRetrieveActionParams,
+    DriveSearchActionParams,
+    DriveShareActionParams,
+    DriveUploadActionParams,
+    GmailDraftParams,
+    GmailReadParams,
+    GmailSendParams,
+    GmailSummarizeParams,
     ListEmailsParams,
     ListEventsParams,
     ListFilesParams,
@@ -12,34 +24,100 @@ from domain.schemas import (
     SendEmailParams,
     UploadFileParams,
 )
-from tools.calendar_tools import create_event, delete_event, list_events
-from tools.drive_tools import delete_file, list_files, upload_file
-from tools.gmail_tools import delete_email, list_emails, search_email, send_email
+from tools.calendar_tools import (
+    calendar_create,
+    calendar_delete,
+    calendar_edit,
+    calendar_list,
+    create_event,
+    delete_event,
+    edit_event,
+    list_events,
+)
+from tools.drive_tools import (
+    delete_file,
+    drive_retrieve,
+    drive_search,
+    drive_share,
+    drive_upload,
+    list_files,
+    retrieve_file,
+    search_files,
+    share_file,
+    upload_file,
+)
+from tools.gmail_tools import (
+    delete_email,
+    draft_email,
+    gmail_read,
+    gmail_send,
+    list_emails,
+    search_email,
+    send_email,
+)
 
 TOOLS = {
+    "gmail_read": gmail_read,
+    "gmail_draft": draft_email,
+    "gmail_send": gmail_send,
     "send_email": send_email,
     "list_emails": list_emails,
     "search_email": search_email,
     "delete_email": delete_email,
+    "calendar_create": calendar_create,
+    "calendar_edit": calendar_edit,
+    "calendar_delete": calendar_delete,
+    "calendar_list": calendar_list,
     "create_event": create_event,
+    "edit_event": edit_event,
     "list_events": list_events,
     "delete_event": delete_event,
+    "drive_upload": drive_upload,
+    "drive_search": drive_search,
+    "drive_retrieve": drive_retrieve,
+    "drive_share": drive_share,
     "list_files": list_files,
     "upload_file": upload_file,
+    "search_files": search_files,
+    "retrieve_file": retrieve_file,
+    "share_file": share_file,
     "delete_file": delete_file,
 }
 
-DESTRUCTIVE_TOOLS = {"send_email", "delete_email", "delete_file", "delete_event"}
+DESTRUCTIVE_TOOLS = {
+    "send_email",
+    "gmail_send",
+    "delete_email",
+    "delete_file",
+    "delete_event",
+    "calendar_delete",
+}
 
 TOOL_PARAMETER_MODELS = {
+    "gmail_read": GmailReadParams,
+    "gmail_summarize": GmailSummarizeParams,
+    "gmail_draft": GmailDraftParams,
+    "gmail_send": GmailSendParams,
     "send_email": SendEmailParams,
     "list_emails": ListEmailsParams,
     "search_email": SearchEmailParams,
     "delete_email": DeleteEmailParams,
+    "calendar_create": CalendarCreateActionParams,
+    "calendar_edit": CalendarEditActionParams,
+    "calendar_delete": CalendarDeleteActionParams,
+    "calendar_list": CalendarListActionParams,
     "create_event": CreateEventParams,
+    "edit_event": CalendarEditActionParams,
     "list_events": ListEventsParams,
     "delete_event": DeleteEventParams,
+    "drive_upload": DriveUploadActionParams,
+    "drive_search": DriveSearchActionParams,
+    "drive_retrieve": DriveRetrieveActionParams,
+    "drive_share": DriveShareActionParams,
     "list_files": ListFilesParams,
     "upload_file": UploadFileParams,
+    "search_files": DriveSearchActionParams,
+    "retrieve_file": DriveRetrieveActionParams,
+    "share_file": DriveShareActionParams,
     "delete_file": DeleteFileParams,
 }

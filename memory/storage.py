@@ -170,6 +170,7 @@ class SQLiteMemoryRepository(MemoryRepository):
             "tool_name": row["tool_name"],
             "account": row["account"],
             "parameters": json.loads(row["parameters_json"]),
+            "created_at": row["created_at"],
         }
 
     def clear_pending_confirmation(self, session_id: str) -> None:

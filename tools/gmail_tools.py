@@ -7,6 +7,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Any, Callable
 
 from googleapiclient.discovery import build
@@ -374,6 +375,115 @@ def send_email(account: str, to: str, subject: str, body: str, request_id: str =
         error_type=None,
     )
     return {"id": sent.get("id"), "thread_id": sent.get("threadId")}
+
+
+def draft_email(
+    account: str,
+    recipient: str,
+    subject: str,
+    message: str,
+    format: str = "plain",
+    request_id: str = "unknown",
+) -> dict:
+    """
+    Build an email draft payload without sending it.
+
+    This tool is intentionally local-only and does not call Gmail APIs.
+    """
+    normalized_subject = (subject or "").strip()
+    if not normalized_subject:
+        words = [w for w in (message or "").strip().split() if w]
+        normalized_subject = " ".join(words[:8]).strip().capitalize() or "No subject"
+
+    normalized_format = "html" if str(format or "plain").lower() == "html" else "plain"
+    return {
+        "recipient": (recipient or "").strip(),
+        "subject": normalized_subject,
+        "message": (message or "").strip(),
+        "format": normalized_format,
+        "preview": {
+            "to": (recipient or "").strip(),
+            "subject": normalized_subject,
+            "body": (message or "").strip(),
+            "format": normalized_format,
+        },
+        "ready_to_send": True,
+        "request_id": request_id,
+        "account": account,
+    }
+
+
+def gmail_read(
+    account: str,
+    max_results: int = 5,
+    query: str = "in:inbox",
+    request_id: str = "unknown",
+) -> dict:
+    """Intent wrapper: read inbox or query-filtered emails."""
+    if query and query.strip() and query.strip() != "in:inbox":
+        return search_email(account=account, query=query.strip(), max_results=max_results, request_id=request_id)
+    return list_emails(account=account, max_results=max_results, request_id=request_id)
+
+
+def gmail_send(
+    account: str,
+    recipient: str,
+    subject: str,
+    message: str,
+    format: str = "plain",
+    request_id: str = "unknown",
+) -> dict:
+    """Intent wrapper: send an email with plain-text or html body."""
+    if not recipient or not subject:
+        raise ValueError("recipient and subject are required")
+
+    tool_name = "gmail_send"
+    started = time.perf_counter()
+    _log(
+        logging.INFO,
+        event="gmail_tool_start",
+        request_id=request_id,
+        tool_name=tool_name,
+        latency_ms=None,
+        error_type=None,
+    )
+
+    service = _build_service(account)
+    fmt = "html" if str(format or "plain").lower() == "html" else "plain"
+
+    if fmt == "html":
+        mime = MIMEMultipart("alternative")
+        mime.attach(MIMEText(message, "html", "utf-8"))
+    else:
+        mime = MIMEText(message, "plain", "utf-8")
+
+    mime["to"] = recipient
+    mime["subject"] = subject
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    request = service.users().messages().send(userId="me", body={"raw": raw})
+    sent = _execute_with_timeout(
+        lambda: request.execute(num_retries=_GMAIL_MAX_RETRIES),
+        tool_name=tool_name,
+        request_id=request_id,
+    )
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    _log(
+        logging.INFO,
+        event="gmail_tool_finish",
+        request_id=request_id,
+        tool_name=tool_name,
+        latency_ms=latency_ms,
+        error_type=None,
+    )
+    return {
+        "id": sent.get("id"),
+        "thread_id": sent.get("threadId"),
+        "recipient": recipient,
+        "subject": subject,
+        "format": fmt,
+    }
 
 
 def search_email(

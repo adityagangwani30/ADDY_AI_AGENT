@@ -3,19 +3,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
 import traceback
 import uuid
+from pathlib import Path
 
 import requests
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from brain.ai_brain import GLOBAL_FALLBACK_RESPONSE, run_agent
+from brain.tool_registry import TOOLS
+from auth.google_auth_manager import list_available_accounts
 from config import TELEGRAM_BOT_TOKEN
+from memory.storage import SQLiteMemoryRepository
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
+MEMORY_REPO = SQLiteMemoryRepository()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -43,6 +50,88 @@ def send_text(chat_id: int, text: str) -> None:
         )
     except Exception:
         pass
+
+
+def send_typing(chat_id: int) -> None:
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _resolve_account_for_session(session_id: str) -> str | None:
+    available = list_available_accounts()
+    if not available:
+        return None
+
+    preferred = MEMORY_REPO.get_account_preference(session_id)
+    if preferred and preferred in available:
+        return preferred
+
+    aliases = MEMORY_REPO.list_account_aliases()
+    mapped = aliases.get("personal")
+    if mapped:
+        for acc in available:
+            if acc.lower() == mapped.lower():
+                MEMORY_REPO.set_account_preference(session_id, acc)
+                return acc
+
+    MEMORY_REPO.set_account_preference(session_id, available[0])
+    return available[0]
+
+
+def _download_telegram_file(file_id: str) -> Path:
+    info = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=10).json()
+    if not info.get("ok"):
+        raise RuntimeError("Telegram getFile failed")
+
+    file_path = str((info.get("result") or {}).get("file_path") or "")
+    if not file_path:
+        raise RuntimeError("Telegram file path missing")
+
+    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    response = requests.get(download_url, timeout=30)
+    response.raise_for_status()
+
+    folder = Path(tempfile.gettempdir()) / "ai-assistant-telegram"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / Path(file_path).name
+    target.write_bytes(response.content)
+    return target
+
+
+def _upload_telegram_document_to_drive(chat_id: int, session_id: str, document_payload: dict[str, object]) -> str:
+    file_id = str(document_payload.get("file_id") or "")
+    if not file_id:
+        return "❌ Could not read the incoming file."
+
+    account = _resolve_account_for_session(session_id)
+    if not account:
+        return "❌ No connected Google account found for Drive upload."
+
+    local_path: Path | None = None
+    try:
+        local_path = _download_telegram_file(file_id)
+        drive_upload = TOOLS.get("drive_upload")
+        if drive_upload is None:
+            return "❌ Drive upload tool is not available."
+        result = drive_upload(account, file_path=str(local_path))
+        return (
+            "📂 File uploaded to Drive\n"
+            f"Name: {result.get('name', local_path.name)}"
+        )
+    except Exception as exc:
+        return f"❌ Drive upload failed: {exc}"
+    finally:
+        if local_path and local_path.exists():
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
 
 
 def send_welcome(chat_id: int) -> None:
@@ -94,8 +183,19 @@ async def telegram_webhook(request: Request):
     chat = message_data.get("chat", {})
     chat_id = chat.get("id")
     user_text = (message_data.get("text") or "").strip()
+    document = message_data.get("document")
 
-    if not chat_id or not user_text:
+    if not chat_id:
+        return JSONResponse({"ok": True})
+
+    # Telegram file flow: document upload to Drive.
+    if isinstance(document, dict):
+        send_typing(chat_id)
+        reply = _upload_telegram_document_to_drive(chat_id, str(chat_id), document)
+        send_text(chat_id, reply)
+        return JSONResponse({"ok": True})
+
+    if not user_text:
         return JSONResponse({"ok": True})
 
     # ── /start command ──────────────────────
@@ -113,6 +213,7 @@ async def telegram_webhook(request: Request):
         error_type=None,
     )
 
+    send_typing(chat_id)
     reply_text = await _run_agent_safe(user_text, str(chat_id), request_id, started)
     send_text(chat_id, reply_text)
     return JSONResponse({"ok": True})
