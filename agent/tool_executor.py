@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any
 
 from brain.llm_provider import call_llm
-from brain.tool_registry import TOOLS
+from brain.tool_registry import TOOLS, normalize_tool_name
 from domain.schemas import (
     CalendarCreateActionParams,
     CalendarDeleteActionParams,
@@ -21,6 +21,7 @@ from domain.schemas import (
     GmailSendParams,
     GmailSummarizeParams,
 )
+from memory.storage import SQLiteMemoryRepository
 
 LOGGER = logging.getLogger(__name__)
 _EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="agent-exec")
@@ -60,6 +61,9 @@ PARAM_MODELS = {
 class ToolExecutor:
     risky_intents = {"gmail_send", "calendar_delete"}
 
+    def __init__(self, audit_repo: SQLiteMemoryRepository | None = None) -> None:
+        self.audit_repo = audit_repo or SQLiteMemoryRepository()
+
     def validate(self, intent: str, parameters: dict[str, Any]) -> dict[str, Any]:
         model = PARAM_MODELS.get(intent)
         if model is None:
@@ -68,7 +72,7 @@ class ToolExecutor:
         return validated.model_dump(exclude_none=True)
 
     def execute(self, intent: str, account: str, parameters: dict[str, Any], request_id: str) -> dict[str, Any]:
-        tool_name = INTENT_TO_TOOL.get(intent)
+        tool_name = normalize_tool_name(INTENT_TO_TOOL.get(intent, intent))
         if not tool_name:
             return {"ok": False, "error": f"Unsupported intent: {intent}", "result": None, "latency_ms": 0}
 
@@ -91,7 +95,8 @@ class ToolExecutor:
         )
 
     def _dispatch(self, tool_name: str, account: str, parameters: dict[str, Any], request_id: str) -> dict[str, Any]:
-        fn = TOOLS.get(tool_name)
+        normalized_tool_name = normalize_tool_name(tool_name)
+        fn = TOOLS.get(normalized_tool_name) or TOOLS.get(tool_name)
         if fn is None:
             return {"ok": False, "error": f"Tool not registered: {tool_name}", "result": None, "latency_ms": 0}
 
@@ -106,27 +111,53 @@ class ToolExecutor:
         future = _EXECUTOR.submit(fn, account, **kwargs)
         try:
             result = future.result(timeout=_TOOL_TIMEOUT_SECONDS)
-            return {
+            payload = {
                 "ok": True,
                 "result": result,
                 "error": None,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
             }
+            self.audit_repo.record_executed_action(
+                action_type=normalized_tool_name,
+                parameters=kwargs,
+                success=True,
+                user_id=account,
+                execution_time_ms=payload["latency_ms"],
+            )
+            return payload
         except FuturesTimeoutError:
             future.cancel()
-            return {
+            payload = {
                 "ok": False,
                 "result": None,
                 "error": f"Tool timeout after {_TOOL_TIMEOUT_SECONDS}s",
                 "latency_ms": int((time.perf_counter() - started) * 1000),
             }
+            self.audit_repo.record_executed_action(
+                action_type=normalized_tool_name,
+                parameters=kwargs,
+                success=False,
+                error_message=payload["error"],
+                user_id=account,
+                execution_time_ms=payload["latency_ms"],
+            )
+            return payload
         except Exception as exc:
-            return {
+            payload = {
                 "ok": False,
                 "result": None,
                 "error": str(exc),
                 "latency_ms": int((time.perf_counter() - started) * 1000),
             }
+            self.audit_repo.record_executed_action(
+                action_type=normalized_tool_name,
+                parameters=kwargs,
+                success=False,
+                error_message=payload["error"],
+                user_id=account,
+                execution_time_ms=payload["latency_ms"],
+            )
+            return payload
 
     def _summarize_emails(self, read_result: dict[str, Any], request_id: str) -> dict[str, Any]:
         payload = read_result.get("result") or {}

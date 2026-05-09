@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from services.logging_service import log_event
+from services.logger import bind_request_id, reset_request_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ def register_middleware(app: FastAPI) -> None:
         request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
         request.state.request_id = request_id
         request.state.raw_body = await request.body()
+        token = bind_request_id(request_id)
 
         started = time.perf_counter()
         try:
@@ -65,4 +67,5 @@ def register_middleware(app: FastAPI) -> None:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Cache-Control"] = "no-store"
+        reset_request_id(token)
         return response

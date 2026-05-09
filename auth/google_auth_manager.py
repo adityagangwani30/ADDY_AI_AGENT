@@ -72,8 +72,10 @@ def save_accounts(accounts: dict[str, Any]) -> None:
     os.environ["ACCOUNTS_JSON"] = json.dumps(accounts, separators=(",", ":"))
     try:
         ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(ACCOUNTS_FILE, "w", encoding="utf-8") as fh:
+        temp_file = ACCOUNTS_FILE.with_suffix(".json.tmp")
+        with open(temp_file, "w", encoding="utf-8") as fh:
             json.dump(accounts, fh, indent=2)
+        temp_file.replace(ACCOUNTS_FILE)
     except IOError as exc:
         LOGGER.error("Failed to save %s: %s", ACCOUNTS_FILE, exc)
 

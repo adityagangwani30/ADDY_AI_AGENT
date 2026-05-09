@@ -119,7 +119,12 @@ def _parse_message_detail(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fetch_message_details(service: Any, message_id: str, request_id: str) -> dict[str, Any]:
-    request = service.users().messages().get(userId="me", id=message_id, format="full")
+    request = service.users().messages().get(
+        userId="me",
+        id=message_id,
+        format="metadata",
+        metadataHeaders=["Subject", "From"],
+    )
     message = _execute_with_timeout(
         lambda: request.execute(num_retries=_GMAIL_MAX_RETRIES),
         tool_name="get_email",

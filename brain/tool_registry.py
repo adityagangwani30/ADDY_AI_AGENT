@@ -56,6 +56,23 @@ from tools.gmail_tools import (
     send_email,
 )
 
+CANONICAL_TOOL_ALIASES = {
+    "send_email": "gmail_send",
+    "list_emails": "gmail_read",
+    "create_event": "calendar_create",
+    "edit_event": "calendar_edit",
+    "delete_event": "calendar_delete",
+    "list_events": "calendar_list",
+    "upload_file": "drive_upload",
+    "search_files": "drive_search",
+    "retrieve_file": "drive_retrieve",
+    "share_file": "drive_share",
+}
+
+
+def normalize_tool_name(tool_name: str) -> str:
+    return CANONICAL_TOOL_ALIASES.get(tool_name, tool_name)
+
 TOOLS = {
     "gmail_read": gmail_read,
     "gmail_draft": draft_email,

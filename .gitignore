@@ -6,6 +6,7 @@
 accounts.json
 client_secret.json
 credentials.json
+token.json
 *.key
 *.pem
 

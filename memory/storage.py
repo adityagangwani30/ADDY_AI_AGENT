@@ -11,6 +11,7 @@ import json
 import sqlite3
 import threading
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -80,10 +81,18 @@ class SQLiteMemoryRepository(MemoryRepository):
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def _initialize_schema(self) -> None:
         """Create all required tables if they do not already exist."""
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
 
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS pending_confirmations (
@@ -118,6 +127,19 @@ class SQLiteMemoryRepository(MemoryRepository):
                         alias TEXT PRIMARY KEY,
                         account TEXT NOT NULL,
                         created_at TEXT NOT NULL
+                    )
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS executed_actions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        parameters_json TEXT NOT NULL,
+                        success INTEGER NOT NULL,
+                        error_message TEXT,
+                        user_id TEXT,
+                        execution_time_ms INTEGER
                     )
                 """)
 
@@ -158,7 +180,7 @@ class SQLiteMemoryRepository(MemoryRepository):
             or ``None`` if no pending confirmation exists.
         """
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 row = conn.execute("""
                     SELECT * FROM pending_confirmations WHERE session_id = ?
                 """, (session_id,)).fetchone()
@@ -176,7 +198,7 @@ class SQLiteMemoryRepository(MemoryRepository):
     def clear_pending_confirmation(self, session_id: str) -> None:
         """Delete the pending confirmation for the given session (after confirmation or cancellation)."""
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("DELETE FROM pending_confirmations WHERE session_id = ?", (session_id,))
                 conn.commit()
 
@@ -186,7 +208,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         """Append a new message to the conversation history for the given session."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("""
                     INSERT INTO conversation_history (session_id, role, content, created_at)
                     VALUES (?, ?, ?, ?)
@@ -205,7 +227,7 @@ class SQLiteMemoryRepository(MemoryRepository):
             A list of dicts with ``role`` and ``content`` in chronological order.
         """
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 rows = conn.execute("""
                     SELECT role, content FROM conversation_history
                     WHERE session_id = ?
@@ -223,7 +245,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         """Persist the most recently used account for a session."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("""
                     INSERT INTO account_preferences (session_id, account, updated_at)
                     VALUES (?, ?, ?)
@@ -238,7 +260,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         Return the last-used account for a session, or ``None`` if not set.
         """
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 row = conn.execute("""
                     SELECT account FROM account_preferences WHERE session_id = ?
                 """, (session_id,)).fetchone()
@@ -251,7 +273,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         """Map a short alias (e.g. ``"college"``) to a full account email address."""
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("""
                     INSERT INTO account_aliases (alias, account, created_at)
                     VALUES (?, ?, ?)
@@ -269,7 +291,7 @@ class SQLiteMemoryRepository(MemoryRepository):
         """
         alias_key = alias.lower()
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 row = conn.execute("""
                     SELECT account FROM account_aliases WHERE alias = ?
                 """, (alias_key,)).fetchone()
@@ -286,7 +308,7 @@ class SQLiteMemoryRepository(MemoryRepository):
             A dict mapping alias strings to email addresses.
         """
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 rows = conn.execute("""
                     SELECT alias, account FROM account_aliases
                 """).fetchall()
@@ -295,3 +317,40 @@ class SQLiteMemoryRepository(MemoryRepository):
         for row in rows:
             aliases[row["alias"]] = row["account"]
         return aliases
+
+    # ---------------- Action Audit ----------------
+
+    def record_executed_action(
+        self,
+        action_type: str,
+        parameters: dict[str, Any],
+        success: bool,
+        error_message: str | None = None,
+        user_id: str | None = None,
+        execution_time_ms: int | None = None,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO executed_actions (
+                        timestamp, action_type, parameters_json, success, error_message, user_id, execution_time_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        timestamp,
+                        action_type,
+                        json.dumps(parameters, default=str),
+                        1 if success else 0,
+                        error_message,
+                        user_id,
+                        execution_time_ms,
+                    ),
+                )
+                conn.commit()
+
+    def health_check(self) -> bool:
+        with self._connection() as conn:
+            conn.execute("SELECT 1")
+        return True

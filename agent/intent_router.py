@@ -88,7 +88,7 @@ class IntentRouter:
         if any(x in low for x in ("draft email", "draft mail", "compose email")):
             return IntentRouteResult(intent="gmail_draft", confidence=0.78, parameters={"message": message})
 
-        if any(x in low for x in ("read email", "list emails", "inbox", "unread emails")):
+        if any(x in low for x in ("read email", "list emails", "list my emails", "show emails", "inbox", "unread emails")):
             return IntentRouteResult(intent="gmail_read", confidence=0.8, parameters={})
 
         if any(x in low for x in ("create event", "add meeting", "schedule", "calendar")):

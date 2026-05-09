@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 
-from auth.google_auth_manager import list_available_accounts
 from brain.llm_provider import FALLBACK_MESSAGE, call_llm
 from domain.schemas import AgentResult
 from memory.storage import SQLiteMemoryRepository
+from services.account_manager import resolve_account_for_session
 
 from agent.confirmation import ConfirmationManager
 from agent.intent_router import IntentRouter
@@ -39,14 +40,17 @@ class PhaseOneAssistant:
         # Confirmation and cancellation handling.
         reply_type = self.confirmation.classify_reply(text)
         if reply_type == "confirm":
-            return self._execute_pending(session_id, rid)
+            result = self._execute_pending(session_id, rid)
+            self._audit_confirmation(session_id, "confirm", result.status == "ok", result.message)
+            return result
         if reply_type == "cancel":
             self.confirmation.clear(session_id)
             msg = "Cancelled the pending action."
+            self._audit_confirmation(session_id, "cancel", True, msg)
             self.memory_repo.add_conversation(session_id, "assistant", msg)
             return AgentResult(request_id=rid, status="ok", message=msg)
 
-        account = self._resolve_active_account(session_id, text)
+        account = resolve_account_for_session(session_id, text=text, memory_repo=self.memory_repo)
         if not account:
             msg = "No connected Google account found. Please connect an account first."
             self.memory_repo.add_conversation(session_id, "assistant", msg)
@@ -76,6 +80,7 @@ class PhaseOneAssistant:
         if route.intent == "gmail_send":
             draft_payload = self._prepare_email_draft(parameters, rid)
             self.confirmation.save(session_id, "gmail_send", account, draft_payload)
+            self._audit_confirmation(session_id, "gmail_send_draft", True, "Confirmation requested")
             preview = self._format_confirmation_preview("gmail_send", draft_payload)
             self.memory_repo.add_conversation(session_id, "assistant", preview)
             return AgentResult(
@@ -88,6 +93,7 @@ class PhaseOneAssistant:
 
         if route.intent in self.executor.risky_intents:
             self.confirmation.save(session_id, route.intent, account, parameters)
+            self._audit_confirmation(session_id, route.intent, True, "Confirmation requested")
             preview = self._format_confirmation_preview(route.intent, parameters)
             self.memory_repo.add_conversation(session_id, "assistant", preview)
             return AgentResult(
@@ -111,35 +117,6 @@ class PhaseOneAssistant:
             data=result.get("result"),
             error_type=None if result.get("ok") else "ToolError",
         )
-
-    def _resolve_active_account(self, session_id: str, text: str) -> str | None:
-        available = list_available_accounts()
-        if not available:
-            return None
-
-        aliases = self.memory_repo.list_account_aliases()
-        low = text.lower()
-        for alias, mapped in aliases.items():
-            if alias in low:
-                for acc in available:
-                    if acc.lower() == mapped.lower():
-                        self.memory_repo.set_account_preference(session_id, acc)
-                        return acc
-
-        preferred = self.memory_repo.get_account_preference(session_id)
-        if preferred and preferred in available:
-            return preferred
-
-        default_alias = aliases.get("personal")
-        if default_alias:
-            for acc in available:
-                if acc.lower() == default_alias.lower():
-                    self.memory_repo.set_account_preference(session_id, acc)
-                    return acc
-
-        fallback = available[0]
-        self.memory_repo.set_account_preference(session_id, fallback)
-        return fallback
 
     def _prepare_email_draft(self, params: dict[str, Any], request_id: str) -> dict[str, Any]:
         recipient = str(params.get("recipient") or "").strip()
@@ -168,6 +145,28 @@ class PhaseOneAssistant:
 
     def _enrich_parameters(self, intent: str, user_text: str, params: dict[str, Any], request_id: str) -> dict[str, Any]:
         payload = dict(params or {})
+
+        if intent in {"gmail_send", "gmail_draft"}:
+            extracted = self._extract_email_parameters(user_text)
+            if extracted:
+                payload.update({key: value for key, value in extracted.items() if value})
+                if payload.get("recipient") and payload.get("message"):
+                    return payload
+
+        if intent in {"calendar_create", "calendar_edit", "calendar_delete"}:
+            extracted = self._extract_calendar_parameters(user_text)
+            if extracted:
+                payload.update({key: value for key, value in extracted.items() if value})
+                if payload.get("title") or payload.get("event_id"):
+                    if intent != "calendar_create" or (payload.get("start_time") and payload.get("end_time")):
+                        return payload
+
+        if intent in {"drive_upload", "drive_search", "drive_retrieve", "drive_share"}:
+            extracted = self._extract_drive_parameters(user_text)
+            if extracted:
+                payload.update({key: value for key, value in extracted.items() if value})
+                if payload.get("filename") or payload.get("file_id") or payload.get("file_path"):
+                    return payload
 
         if intent in {"gmail_send", "gmail_draft"}:
             if payload.get("recipient") and payload.get("message"):
@@ -230,6 +229,65 @@ class PhaseOneAssistant:
             if parsed:
                 payload.update(parsed)
             return payload
+
+        return payload
+
+    def _extract_email_parameters(self, text: str) -> dict[str, str]:
+        low = text.lower()
+        recipient_match = re.search(r"\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b", text, flags=re.IGNORECASE)
+        subject_match = re.search(r"subject\s*[:=]\s*([^\n;]+)", text, flags=re.IGNORECASE)
+        body_match = re.search(r"body\s*[:=]\s*(.+)", text, flags=re.IGNORECASE | re.DOTALL)
+
+        payload: dict[str, str] = {}
+        if recipient_match:
+            payload["recipient"] = recipient_match.group(1).strip()
+        if subject_match:
+            payload["subject"] = subject_match.group(1).strip().strip('"')
+        if body_match:
+            payload["message"] = body_match.group(1).strip()
+
+        if not payload.get("message"):
+            quoted = re.search(r"(?:email|message|body)\s+['\"]([^'\"]{8,})['\"]", text, flags=re.IGNORECASE)
+            if quoted:
+                payload["message"] = quoted.group(1).strip()
+
+        if "send" in low and not payload.get("subject"):
+            short_subject = re.search(r"(?:about|subject|re)\s+([^\n]+)", text, flags=re.IGNORECASE)
+            if short_subject:
+                payload["subject"] = short_subject.group(1).strip()[:200]
+
+        return payload
+
+    def _extract_calendar_parameters(self, text: str) -> dict[str, str]:
+        payload: dict[str, str] = {}
+        title_match = re.search(r"(?:titled?|title)\s*[:=]\s*([^\n;]+)", text, flags=re.IGNORECASE)
+        start_match = re.search(r"\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)\b", text)
+        end_match = re.search(r"\bto\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)\b", text, flags=re.IGNORECASE)
+        event_id_match = re.search(r"\bevent\s+id\s*[:=]\s*([A-Za-z0-9_-]+)", text, flags=re.IGNORECASE)
+
+        if title_match:
+            payload["title"] = title_match.group(1).strip()
+        if start_match:
+            payload["start_time"] = start_match.group(1).replace(" ", "T")
+        if end_match:
+            payload["end_time"] = end_match.group(1).replace(" ", "T")
+        if event_id_match:
+            payload["event_id"] = event_id_match.group(1).strip()
+
+        return payload
+
+    def _extract_drive_parameters(self, text: str) -> dict[str, str]:
+        payload: dict[str, str] = {}
+        path_match = re.search(r"(?:file|path)\s*[:=]\s*([^\n;]+)", text, flags=re.IGNORECASE)
+        filename_match = re.search(r"(?:named|name)\s+['\"]?([^'\"\n]+)['\"]?", text, flags=re.IGNORECASE)
+        file_id_match = re.search(r"\bfile\s+id\s*[:=]\s*([A-Za-z0-9_-]+)", text, flags=re.IGNORECASE)
+
+        if path_match:
+            payload["file_path"] = path_match.group(1).strip()
+        if filename_match:
+            payload["filename"] = filename_match.group(1).strip()
+        if file_id_match:
+            payload["file_id"] = file_id_match.group(1).strip()
 
         return payload
 
@@ -305,6 +363,19 @@ class PhaseOneAssistant:
             data=result.get("result"),
             error_type=None if result.get("ok") else "ToolError",
         )
+
+    def _audit_confirmation(self, session_id: str, action_type: str, success: bool, message: str) -> None:
+        try:
+            self.memory_repo.record_executed_action(
+                action_type=action_type,
+                parameters={"session_id": session_id, "message": message},
+                success=success,
+                user_id=session_id,
+                execution_time_ms=0,
+                error_message=None if success else message,
+            )
+        except Exception:
+            pass
 
     def _format_tool_result(self, intent: str, result: dict[str, Any]) -> tuple[str, str]:
         if not result.get("ok"):

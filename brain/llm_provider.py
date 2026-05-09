@@ -162,6 +162,21 @@ _PROVIDERS = {
 }
 
 
+def get_provider_health() -> dict[str, str]:
+    groq_status = "configured" if GROQ_API_KEY else "missing"
+    nvidia_status = "configured" if NVIDIA_API_KEY else "missing"
+    status = "healthy" if groq_status == "configured" else "degraded"
+    if groq_status != "configured" and nvidia_status == "configured":
+        status = "degraded"
+    elif groq_status != "configured" and nvidia_status != "configured":
+        status = "unavailable"
+    return {
+        "status": status,
+        "groq": groq_status,
+        "nvidia": nvidia_status,
+    }
+
+
 # ── Unified caller with automatic fallback ─────────────────────────────
 
 
