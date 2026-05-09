@@ -254,6 +254,30 @@ Design goals:
 - Chunk-aware retrieval to avoid sending whole documents to LLMs.
 - Lightweight, free-tier friendly.
 
+## Phase 4 — Automation (Added)
+
+This project now includes a lightweight automation engine designed for Render free-tier deployments. Key features:
+
+- SQLite-backed `scheduled_tasks` persistence (see `automation/db.py`).
+- `AutomationEngine` for scheduling, listing, pausing, rescheduling, and cancelling tasks (`automation/automation_engine.py`).
+- `TaskRunner` lightweight async runner with configurable polling and graceful shutdown (`automation/task_runner.py`).
+- Handler registry for task actions; built-in `send_reminder` handler (`automation/handlers.py`).
+- Tests for scheduling and runner under `tests/test_automation.py`.
+
+Quick start (example usage in Python):
+
+```python
+from automation.automation_engine import AutomationEngine
+from automation.task_runner import TaskRunner
+from datetime import datetime, timedelta
+
+engine = AutomationEngine("automation.db")
+engine.schedule_task("me", "send_reminder", {"message": "Submit report"}, datetime.utcnow() + timedelta(minutes=5))
+runner = TaskRunner("automation.db")
+# in production, run runner.start() inside an asyncio loop; for tests use runner.run_once()
+```
+
+See docs and comments in the `automation/` package for more details.
 
 ## License
 

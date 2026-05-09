@@ -27,6 +27,14 @@ from services.document_processor import process_file
 from memory.file_index import FileIndex
 from memory.memory_manager import MemoryManager
 from services import ocr_service
+from datetime import datetime, timedelta
+from typing import Optional
+import config as _config
+
+# Automation engine
+from automation.automation_engine import AutomationEngine
+
+_AUTOMATION_ENGINE = AutomationEngine(str(_config.BASE_DIR / "automation.db"))
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
@@ -343,3 +351,103 @@ async def health() -> JSONResponse:
         "telegram": "ok" if telegram_ok else "missing",
     }
     return JSONResponse(payload)
+
+
+@router.post("/automation/schedule")
+async def automation_schedule(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+
+    user_id = body.get("user_id") or str(request.headers.get("X-User-Id") or "anonymous")
+    task_type = body.get("task_type")
+    if not task_type:
+        return JSONResponse({"ok": False, "error": "task_type required"}, status_code=400)
+
+    payload = body.get("task_payload") or {}
+    # scheduled_time may be ISO string or can be provided as delay_seconds
+    delay = body.get("delay_seconds")
+    scheduled_time = body.get("scheduled_time")
+    if delay is not None:
+        try:
+            delay = int(delay)
+            scheduled_dt = datetime.utcnow() + timedelta(seconds=delay)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid delay_seconds"}, status_code=400)
+    elif scheduled_time:
+        try:
+            scheduled_dt = datetime.fromisoformat(scheduled_time)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid scheduled_time"}, status_code=400)
+    else:
+        # default: run immediately
+        scheduled_dt = datetime.utcnow()
+
+    recurrence = body.get("recurrence")
+    task_id = _AUTOMATION_ENGINE.schedule_task(user_id=user_id, task_type=task_type, task_payload=payload, scheduled_time=scheduled_dt, recurrence=recurrence)
+    return JSONResponse({"ok": True, "task_id": task_id})
+
+
+@router.get("/automation/tasks")
+async def automation_list(user_id: Optional[str] = None):
+    tasks = _AUTOMATION_ENGINE.list_tasks(user_id)
+    return JSONResponse({"ok": True, "tasks": tasks})
+
+
+@router.post("/automation/cancel")
+async def automation_cancel(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    task_id = body.get("task_id")
+    if not task_id:
+        return JSONResponse({"ok": False, "error": "task_id required"}, status_code=400)
+    _AUTOMATION_ENGINE.cancel_task(int(task_id))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/automation/pause")
+async def automation_pause(request: Request):
+    body = await request.json()
+    task_id = body.get("task_id")
+    if not task_id:
+        return JSONResponse({"ok": False, "error": "task_id required"}, status_code=400)
+    _AUTOMATION_ENGINE.pause_task(int(task_id))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/automation/resume")
+async def automation_resume(request: Request):
+    body = await request.json()
+    task_id = body.get("task_id")
+    if not task_id:
+        return JSONResponse({"ok": False, "error": "task_id required"}, status_code=400)
+    _AUTOMATION_ENGINE.resume_task(int(task_id))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/automation/reschedule")
+async def automation_reschedule(request: Request):
+    body = await request.json()
+    task_id = body.get("task_id")
+    new_time = body.get("new_time")
+    delay = body.get("delay_seconds")
+    if not task_id:
+        return JSONResponse({"ok": False, "error": "task_id required"}, status_code=400)
+    if delay is not None:
+        try:
+            delay = int(delay)
+            scheduled_dt = datetime.utcnow() + timedelta(seconds=delay)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid delay_seconds"}, status_code=400)
+    elif new_time:
+        try:
+            scheduled_dt = datetime.fromisoformat(new_time)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "invalid new_time"}, status_code=400)
+    else:
+        return JSONResponse({"ok": False, "error": "new_time or delay_seconds required"}, status_code=400)
+    _AUTOMATION_ENGINE.reschedule_task(int(task_id), scheduled_dt)
+    return JSONResponse({"ok": True})
