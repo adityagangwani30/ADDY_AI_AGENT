@@ -14,6 +14,8 @@ from services.account_manager import resolve_account_for_session
 from agent.confirmation import ConfirmationManager
 from agent.intent_router import IntentRouter
 from agent.tool_executor import ToolExecutor
+from services import document_qa as doc_qa
+from services import alias_service
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,7 +69,26 @@ class PhaseOneAssistant:
             self.memory_repo.add_conversation(session_id, "assistant", answer)
             return AgentResult(request_id=rid, status="ok", message=answer)
 
+        if route.intent == "document_qa":
+            # run document QA pipeline (deterministic-first)
+            answer = doc_qa.answer_question(user_id=session_id, question=text, request_id=rid)
+            self.memory_repo.add_conversation(session_id, "assistant", answer)
+            return AgentResult(request_id=rid, status="ok", message=answer)
+
         routed_params = self._enrich_parameters(route.intent, text, route.parameters, rid)
+
+        # alias learning: simple deterministic detection that requests confirmation
+        try:
+            candidate = alias_service.learn_alias_from_text(text)
+            if candidate:
+                alias, file_id = candidate
+                # save pending alias mapping for confirmation
+                self.confirmation.save(session_id, "alias_map", session_id, {"alias": alias, "file_id": file_id})
+                preview = f"I detected a reference to '{alias}' — map it to the most recent file? Reply YES to confirm or CANCEL."
+                self.memory_repo.add_conversation(session_id, "assistant", preview)
+                return AgentResult(request_id=rid, status="confirmation_required", message=preview, tool_name="alias_map")
+        except Exception:
+            pass
 
         try:
             parameters = self.executor.validate(route.intent, routed_params)
@@ -349,6 +370,20 @@ class PhaseOneAssistant:
         intent = str(pending.get("tool_name") or "")
         account = str(pending.get("account") or "")
         params = dict(pending.get("parameters") or {})
+
+        # special-case alias mapping
+        if intent == "alias_map":
+            alias = str(params.get("alias") or "")
+            file_id = str(params.get("file_id") or "")
+            try:
+                _id = self.memory_repo.set_entity_alias(session_id, alias, file_id, entity_type="file")
+                msg = f"Alias '{alias}' mapped to the file." if _id else "Alias mapping saved."
+                self.memory_repo.add_conversation(session_id, "assistant", msg)
+                return AgentResult(request_id=request_id, status="ok", message=msg, tool_name="alias_map")
+            except Exception as exc:
+                msg = f"Failed to save alias: {exc}"
+                self.memory_repo.add_conversation(session_id, "assistant", msg)
+                return AgentResult(request_id=request_id, status="error", message=msg, error_type=type(exc).__name__)
 
         result = self.executor.execute(intent, account, params, request_id)
         message, status = self._format_tool_result(intent, result)

@@ -10,7 +10,7 @@ from domain.schemas import IntentRouteResult
 ROUTER_PROMPT = """You are an intent router for a personal AI assistant.
 Classify the user request and return ONLY strict JSON:
 {
-  \"intent\": \"gmail_read|gmail_summarize|gmail_draft|gmail_send|calendar_create|calendar_edit|calendar_delete|calendar_list|drive_upload|drive_search|drive_retrieve|drive_share|general_chat|unknown\",
+    \"intent\": \"gmail_read|gmail_summarize|gmail_draft|gmail_send|calendar_create|calendar_edit|calendar_delete|calendar_list|drive_upload|drive_search|drive_retrieve|drive_share|document_qa|general_chat|unknown\",
   \"confidence\": 0.0,
   \"parameters\": {}
 }
@@ -109,6 +109,10 @@ class IntentRouter:
                 return IntentRouteResult(intent="drive_search", confidence=0.82, parameters={"filename": message})
             if any(x in low for x in ("get", "retrieve", "open")):
                 return IntentRouteResult(intent="drive_retrieve", confidence=0.72, parameters={"filename": message})
+
+        # document QA quick routing: questions about uploaded documents
+        if any(x in low for x in ("what", "summarize", "conclusions", "results", "summary", "summary of", "what did")) and any(y in low for y in ("pdf", "report", "paper", "document", "uploaded", "resume", "notes")):
+            return IntentRouteResult(intent="document_qa", confidence=0.86, parameters={})
 
         if any(x in low for x in ("hi", "hello", "how are you", "what is", "who is", "explain", "help")):
             return IntentRouteResult(intent="general_chat", confidence=0.62, parameters={})
