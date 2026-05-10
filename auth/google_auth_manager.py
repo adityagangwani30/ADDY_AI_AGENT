@@ -41,30 +41,34 @@ class AuthReauthRequired(RuntimeError):
 
 
 def load_accounts() -> dict[str, Any]:
-    """Load accounts with ENV priority (Render-safe)."""
+    """Load accounts from ENV and local file, preserving every saved account."""
 
-    # Priority 1: ENV (Render / cloud)
-    env_value = os.getenv("ACCOUNTS_JSON")
-    if env_value:
-        try:
-            data = json.loads(env_value)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError as exc:
-            LOGGER.error("Failed to parse ACCOUNTS_JSON env var: %s", exc)
+    merged_accounts: dict[str, Any] = {}
 
-    # Priority 2: local file (dev fallback)
+    # Load local file first so repeated auth runs keep previously saved accounts.
     if ACCOUNTS_FILE.exists():
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
                 if isinstance(data, dict):
-                    return data
+                    merged_accounts.update(data)
         except (json.JSONDecodeError, IOError) as exc:
             LOGGER.error("Failed to load %s: %s", ACCOUNTS_FILE, exc)
 
-    LOGGER.warning("No account data found (neither ACCOUNTS_JSON env nor %s file).", ACCOUNTS_FILE)
-    return {}
+    # Merge ENV on top so deployments can still inject or override accounts.
+    env_value = os.getenv("ACCOUNTS_JSON")
+    if env_value:
+        try:
+            data = json.loads(env_value)
+            if isinstance(data, dict):
+                merged_accounts.update(data)
+        except json.JSONDecodeError as exc:
+            LOGGER.error("Failed to parse ACCOUNTS_JSON env var: %s", exc)
+
+    if not merged_accounts:
+        LOGGER.warning("No account data found (neither ACCOUNTS_JSON env nor %s file).", ACCOUNTS_FILE)
+
+    return merged_accounts
 
 
 def save_accounts(accounts: dict[str, Any]) -> None:

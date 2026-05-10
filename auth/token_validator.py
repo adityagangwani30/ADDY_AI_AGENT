@@ -14,12 +14,24 @@ from auth.google_auth_manager import ACCOUNTS_FILE, list_available_accounts, loa
 from config import (
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
-    GOOGLE_REFRESH_TOKEN,
+    GOOGLE_REFRESH_TOKEN_1,
+    GOOGLE_REFRESH_TOKEN_2,
+    GOOGLE_REFRESH_TOKEN_3,
+    GOOGLE_REFRESH_TOKEN_4,
     GOOGLE_SCOPES,
     GOOGLE_TOKEN_URI,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _bootstrap_refresh_tokens() -> dict[str, str]:
+    return {
+        "GOOGLE_REFRESH_TOKEN_1": GOOGLE_REFRESH_TOKEN_1,
+        "GOOGLE_REFRESH_TOKEN_2": GOOGLE_REFRESH_TOKEN_2,
+        "GOOGLE_REFRESH_TOKEN_3": GOOGLE_REFRESH_TOKEN_3,
+        "GOOGLE_REFRESH_TOKEN_4": GOOGLE_REFRESH_TOKEN_4,
+    }
 
 
 def _build_credentials_from_account_data(account_name: str) -> Credentials:
@@ -81,7 +93,7 @@ def validate_refresh_token(
     token_uri: str | None = None,
     scopes: list[str] | None = None,
 ) -> dict[str, Any]:
-    token = (refresh_token or GOOGLE_REFRESH_TOKEN or "").strip()
+    token = (refresh_token or GOOGLE_REFRESH_TOKEN_1 or "").strip()
     if not token:
         return {"status": "missing", "refresh_token": "missing"}
 
@@ -182,9 +194,13 @@ def validate_account_health(account_name: str) -> dict[str, Any]:
 
 def validate_oauth_health() -> dict[str, Any]:
     report: dict[str, Any] = {
-        "bootstrap": validate_refresh_token(),
+        "bootstrap": validate_refresh_token(refresh_token=GOOGLE_REFRESH_TOKEN_1),
+        "bootstrap_tokens": {},
         "accounts": {},
     }
+
+    for slot_name, slot_token in _bootstrap_refresh_tokens().items():
+        report["bootstrap_tokens"][slot_name] = validate_refresh_token(refresh_token=slot_token)
 
     for account in list_available_accounts():
         report["accounts"][account] = validate_account_health(account)

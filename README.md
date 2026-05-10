@@ -136,7 +136,10 @@ Create a `.env` file and set the required values:
 | `NVIDIA_API_KEY` | Fallback LLM provider key |
 | `GOOGLE_CLIENT_ID` | Google OAuth client ID |
 | `GOOGLE_CLIENT_SECRET` | Google OAuth client secret |
-| `GOOGLE_REFRESH_TOKEN` | Bootstrap refresh token used for validation |
+| `GOOGLE_REFRESH_TOKEN_1` | Required bootstrap refresh token for your first mailbox (`adityagangwaniexam@gmail.com`) |
+| `GOOGLE_REFRESH_TOKEN_2` | Optional refresh token for mailbox 2 |
+| `GOOGLE_REFRESH_TOKEN_3` | Optional refresh token for mailbox 3 |
+| `GOOGLE_REFRESH_TOKEN_4` | Optional refresh token for mailbox 4 |
 | `ACCOUNTS_JSON` | Optional JSON string of stored account credentials |
 
 ### 3. Run the server
@@ -172,7 +175,7 @@ What it does:
 - validates Gmail, Calendar, and Drive access together
 - prints a clean success or failure summary
 
-If you rotate Google credentials, update `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REFRESH_TOKEN`, then rerun `python reauth.py --check`.
+If you rotate Google credentials, update `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and at least `GOOGLE_REFRESH_TOKEN_1`, then rerun `python reauth.py --check`. Add `GOOGLE_REFRESH_TOKEN_2` through `GOOGLE_REFRESH_TOKEN_4` when you connect the remaining mailboxes.
 
 ---
 

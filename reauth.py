@@ -23,7 +23,7 @@ from auth.google_auth_manager import (
     AuthReauthRequired,
     authenticate_account as core_authenticate_account,
 )
-from auth.token_validator import validate_account_health, validate_oauth_health, validate_refresh_token
+from auth.token_validator import validate_account_health, validate_oauth_health
 
 CREDENTIALS_FILE = ROOT / "credentials.json"
 authenticate_account = core_authenticate_account
@@ -117,9 +117,15 @@ def reauthenticate_all_accounts(force: bool = False) -> None:
 
 
 def validate_bootstrap_tokens() -> dict:
-    bootstrap = validate_refresh_token()
+    health = validate_oauth_health()
+    bootstrap = health.get("bootstrap", {})
     print(f"Bootstrap token status: {bootstrap.get('status')}")
-    return bootstrap
+
+    bootstrap_tokens = health.get("bootstrap_tokens", {})
+    for slot_name, token_health in bootstrap_tokens.items():
+        print(f"  {slot_name}: {token_health.get('status')}")
+
+    return health
 
 
 def main() -> None:
